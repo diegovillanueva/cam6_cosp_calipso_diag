@@ -1,0 +1,415 @@
+diff --git a/src/physics/cam/cloud_top_diag_rates.F90 b/src/physics/cam/cloud_top_diag_rates.F90
+new file mode 100644
+index 0000000..c4cb3d8
+--- /dev/null
++++ b/src/physics/cam/cloud_top_diag_rates.F90
+@@ -0,0 +1,409 @@
++module cloud_top_diag_rates
++!---------------------------------------------------------------------------------
++! Fixed table of MG2 process rates handed to cloud_top_diag (one entry per
++! <VAR>_PATH family). Filled once per chunk in micro_mg_cam_tend_pack after the
++! MG2 call (and after the substep average of post_proc), only when ctd_on.
++!
++! Conventions of ctd_rates_t%val(pcols,pver,ctd_nrates):
++!   - grid-box mean (all MG2 *tot outputs are already multiplied by lcldm,
++!     icldm or precip_frac; see "MG2 source" below),
++!   - kg/kg/s for mass, 1/kg/s for number,
++!   - positive in the process direction of the long name (sign flips noted).
++! ctd_rates_t%sfc_flux(pcols,4) = rflx, sflx, lflx, iflx at pver+1 [kg/m2/s],
++!    ctd_rates_t%ten(pcols,pver,8) = MG2 tendencies QC, QI, QR, QS, NC, NI, NR, NS,
++!    ctd_rates_t%st(pcols,pver,8)  = post-microphysics grid-mean states for the
++!    column burdens CDNUMC..RDMASS.
++!
++! Audit of the rates (micro_mg2_0.F90 at cam_cesm2_1_rel_60 + mg2_limiter_update):
++!
++! | name       | units   | long_name                                                | MG2 source                    | sign convention                          | grid-mean |
++! |------------|---------|----------------------------------------------------------|-------------------------------|------------------------------------------|-----------|
++! | PRCO       | kg/kg/s | Autoconversion of cloud water to rain                    | prctot = prc*lcldm            | + liquid -> rain                         | yes |
++! | PRAO       | kg/kg/s | Accretion of cloud water by rain                         | pratot = pra*lcldm            | + liquid -> rain                         | yes |
++! | MNUCCCO    | kg/kg/s | Immersion freezing of cloud water                        | mnuccctot = mnuccc*lcldm      | + liquid -> ice                          | yes |
++! | MNUCCTO    | kg/kg/s | Contact freezing of cloud water                          | mnuccttot = mnucct*lcldm      | + liquid -> ice                          | yes |
++! | HOMOO      | kg/kg/s | Homogeneous freezing of cloud water                      | homotot (instantaneous, grid) | + liquid -> ice                          | yes |
++! | MSACWIO    | kg/kg/s | Hallett-Mossop splinter production (cloud water to ice)  | msacwitot = msacwi*lcldm      | + liquid -> ice                          | yes |
++! | PSACWSO    | kg/kg/s | Riming: accretion of cloud water by snow                 | psacwstot = psacws*lcldm      | + liquid -> snow                         | yes |
++! | BERGO      | kg/kg/s | Bergeron process, cloud water to cloud ice               | bergtot = berg (no cf factor) | + liquid -> ice                          | yes (*) |
++! | BERGSO     | kg/kg/s | Bergeron process, cloud water to snow                    | bergstot = bergs*lcldm        | + liquid -> snow                         | yes |
++! | PRCIO      | kg/kg/s | Autoconversion of cloud ice to snow                      | prcitot = prci*icldm          | + ice -> snow                            | yes |
++! | PRAIO      | kg/kg/s | Accretion of cloud ice by snow                           | praitot = prai*icldm          | + ice -> snow                            | yes |
++! | MNUCCDO    | kg/kg/s | Ice nucleation (vapour to cloud ice), grid-mean          | ctd_mnuccdgtot = mnuccd (new) | + vapour -> ice                          | yes (**) |
++! | MNUDEPO    | kg/kg/s | Deposition freezing (hetfrz) of vapour to cloud ice      | ctd_mnudeptot = mnudep*lcldm  | + vapour -> ice                          | yes (new) |
++! | CMEIOUT    | kg/kg/s | Net deposition (+) / sublimation (-) of cloud ice        | cmeitot = vap_dep+ice_sublim+mnuccd | + deposition, - sublimation        | yes |
++! | QIRESO     | kg/kg/s | Residual deposition of excess supersaturation to ice     | qirestot                      | + vapour -> ice                          | yes |
++! | QCRESO     | kg/kg/s | Residual condensation of excess supersaturation to water | qcrestot                      | + vapour -> liquid                       | yes |
++! | QVRES      | kg/kg/s | Residual condensation of excess supersaturation (vapour sink) | -qvres                   | flipped: MG2 qvres <= 0; here +          | yes |
++! | CMEOUT     | kg/kg/s | Net vapour to cloud: ice dep/sub + nucleation + residual | cmeout (cam: cmeice)          | + vapour -> cloud                        | yes |
++! | PRACSO     | kg/kg/s | Accretion of rain by snow                                | pracstot = pracs*precip_frac  | + rain -> snow                           | yes |
++! | MNUCCRO    | kg/kg/s | Heterogeneous freezing of rain to snow                   | mnuccrtot = mnuccr*precip_frac| + rain -> snow                           | yes |
++! | MNUCCRIO   | kg/kg/s | Heterogeneous freezing of rain to cloud ice              | ctd_mnuccritot = mnuccri*precip_frac | + rain -> ice                     | yes (new) |
++! | FRZRDT     | kg/kg/s | Homogeneous freezing of rain (to snow or ice)            | frzrdttot / latice            | + rain -> snow/ice; W/kg -> kg/kg/s      | yes |
++! | MELTSDT    | kg/kg/s | Melting of snow to rain                                  | -meltsdttot / latice          | flipped: meltsdttot <= 0 W/kg            | yes |
++! | MELTO      | kg/kg/s | Melting of cloud ice to cloud water                      | melttot (instantaneous)       | + ice -> liquid                          | yes |
++! | EVPRAIN_ST | kg/kg/s | Evaporation of stratiform rain                           | nevapr - evapsnow = -pre*precip_frac | + rain -> vapour                  | yes |
++! | EVPSNOW_ST | kg/kg/s | Sublimation of stratiform snow                           | evapsnow = -prds*precip_frac  | + snow -> vapour                         | yes |
++! | QCSEVAP    | kg/kg/s | Evaporation of falling cloud water                       | qcsevap                       | + liquid -> vapour                       | yes |
++! | QISEVAP    | kg/kg/s | Sublimation of falling cloud ice                         | qisevap                       | + ice -> vapour                          | yes |
++! | PRER_EVAP  | kg/kg/s | Evaporation of stratiform rain (last substep)            | prer_evap = -pre*precip_frac  | + rain -> vapour; = EVPRAIN_ST if 1 substep | yes |
++! | QCSEDTEN   | kg/kg/s | Cloud water tendency from sedimentation                  | qcsedten                      | + layer gain; column sum = -LFLX_SFC     | yes |
++! | QISEDTEN   | kg/kg/s | Cloud ice tendency from sedimentation                    | qisedten                      | + layer gain; column sum = -IFLX_SFC     | yes |
++! | QRSEDTEN   | kg/kg/s | Rain tendency from sedimentation                         | qrsedten                      | + layer gain; column sum = -RFLX_SFC     | yes |
++! | QSSEDTEN   | kg/kg/s | Snow tendency from sedimentation                         | qssedten                      | + layer gain; column sum = -SFLX_SFC     | yes |
++! | FRZIMM     | 1/kg/s  | Droplet number frozen by immersion freezing              | ctd_nnuccctot = nnuccc*lcldm  | + droplets -> ice (after nc limiter)     | yes (new) |
++! | FRZCNT     | 1/kg/s  | Droplet number frozen by contact freezing                | ctd_nnuccttot = nnucct*lcldm  | + droplets -> ice (after nc limiter)     | yes (new) |
++! | FRZDEP     | 1/kg/s  | Ice number from deposition freezing (hetfrz)             | ctd_nnudeptot = nnudep*lcldm  | + vapour -> ice                          | yes (new) |
++!
++! (*)  berg is applied to qc/qi without a cloud-fraction factor (MG2 assumes the
++!      Bergeron rate acts over the whole step), so bergtot is what leaves the grid box.
++! (**) upstream MNUCCDO = mnuccd*icldm, but mnuccd is already grid-mean
++!      (nnuccd = (naai - ni/icldm)/mtime*icldm, qitend adds mnuccd directly), so the
++!      upstream field carries icldm twice. The table uses mnuccd; upstream MNUCCDO is unchanged.
++! Removed vs dv_diag: the old FRZIMM/FRZCNT/FRZDEP_PATH used the hetfrz inputs
++!    frzimm*1e6/rho, i.e. in-cloud, before the MG2 number limiter, zero without
++!    use_hetfrz_classnuc, and with units "1/m2" instead of "1/m2/s".
++!
++! Rain budget (stratiform, column-integrated; sedimentation terms cancel):
++!   RFLX_SFC = PRCO + PRAO + MELTSDT - PRACSO - MNUCCRO - MNUCCRIO - FRZRDT - EVPRAIN_ST - d(RDMASS)/dt
++!---------------------------------------------------------------------------------
++
++use shr_kind_mod, only: r8 => shr_kind_r8
++use ppgrid,       only: pcols, pver, pverp
++use physconst,    only: latice
++
++implicit none
++private
++save
++
++public :: ctd_rates_t, ctd_rates_fill, ctd_rates_free
++public :: ctd_ext_put, ctd_ext_sfc_put, ctd_ext_get, ctd_ext_init
++
++! pbuf indices of CTD_EXT / CTD_EXT_SFC, looked up once in ctd_ext_init (-1 = not registered)
++integer :: ext_idx = -1, ext_sfc_idx = -1
++
++! Names of the physpkg-scope pbuf fields shared by the ctd modules (registered in micro_mg_cam_register when ctd_on):
++!   CTD_EXT     (pcols,pver,ctd_next) rates outside MG2 (written by clubb_intr / zm_conv_intr)
++!   CTD_EXT_SFC (pcols,ctd_nsfx)      ZM surface precipitation fluxes
++!   CTD_IBIN    (pcols,3)             ctt_bin index of the cloud top per threshold from the last cloud_top_diag_run call (0 = no top)
++character(len=*), public, parameter :: ctd_pbuf_ext = 'CTD_EXT', ctd_pbuf_ext_sfc = 'CTD_EXT_SFC', ctd_pbuf_ibin = 'CTD_IBIN'
++
++integer, public, parameter :: ctd_nrates = 36
++
++character(len=10), public, parameter :: ctd_rate_name(ctd_nrates) = [character(len=10) :: &
++     'PRCO', 'PRAO', 'MNUCCCO', 'MNUCCTO', 'HOMOO', 'MSACWIO', 'PSACWSO', 'BERGO', 'BERGSO', &
++     'PRCIO', 'PRAIO', 'MNUCCDO', 'MNUDEPO', 'CMEIOUT', 'QIRESO', 'QCRESO', 'QVRES', 'CMEOUT', &
++     'PRACSO', 'MNUCCRO', 'MNUCCRIO', 'FRZRDT', 'MELTSDT', 'MELTO', &
++     'EVPRAIN_ST', 'EVPSNOW_ST', 'QCSEVAP', 'QISEVAP', 'PRER_EVAP', &
++     'QCSEDTEN', 'QISEDTEN', 'QRSEDTEN', 'QSSEDTEN', &
++     'FRZIMM', 'FRZCNT', 'FRZDEP']
++
++character(len=8), public, parameter :: ctd_rate_units(ctd_nrates) = [character(len=8) :: &
++     'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', &
++     'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', &
++     'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', &
++     'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', &
++     'kg/kg/s', '1/kg/s', '1/kg/s', '1/kg/s']
++
++character(len=64), public, parameter :: ctd_rate_long(ctd_nrates) = [character(len=64) :: &
++     'Autoconversion of cloud water to rain', &
++     'Accretion of cloud water by rain', &
++     'Immersion freezing of cloud water', &
++     'Contact freezing of cloud water', &
++     'Homogeneous freezing of cloud water', &
++     'Hallett-Mossop splinter production (cloud water to ice)', &
++     'Riming: accretion of cloud water by snow', &
++     'Bergeron process, cloud water to cloud ice', &
++     'Bergeron process, cloud water to snow', &
++     'Autoconversion of cloud ice to snow', &
++     'Accretion of cloud ice by snow', &
++     'Ice nucleation (vapour to cloud ice), grid-mean', &
++     'Deposition freezing (hetfrz) of vapour to cloud ice', &
++     'Net deposition (+) / sublimation (-) of cloud ice', &
++     'Residual deposition of excess supersaturation to ice', &
++     'Residual condensation of excess supersaturation to water', &
++     'Residual condensation of excess supersaturation (vapour sink)', &
++     'Net vapour to cloud: ice dep/sub + nucleation + residual', &
++     'Accretion of rain by snow', &
++     'Heterogeneous freezing of rain to snow', &
++     'Heterogeneous freezing of rain to cloud ice', &
++     'Homogeneous freezing of rain (to snow or ice)', &
++     'Melting of snow to rain', &
++     'Melting of cloud ice to cloud water', &
++     'Evaporation of stratiform rain', &
++     'Sublimation of stratiform snow', &
++     'Evaporation of falling cloud water', &
++     'Sublimation of falling cloud ice', &
++     'Evaporation of stratiform rain (last substep)', &
++     'Cloud water tendency from sedimentation', &
++     'Cloud ice tendency from sedimentation', &
++     'Rain tendency from sedimentation', &
++     'Snow tendency from sedimentation', &
++     'Droplet number frozen by immersion freezing', &
++     'Droplet number frozen by contact freezing', &
++     'Ice number from deposition freezing (hetfrz)']
++
++! Surface fluxes, sfc_flux(:,j) [kg/m2/s]
++character(len=10), public, parameter :: ctd_sfc_name(4) = [character(len=10) :: &
++     'RFLX_SFC', 'SFLX_SFC', 'LFLX_SFC', 'IFLX_SFC']
++character(len=64), public, parameter :: ctd_sfc_long(4) = [character(len=64) :: &
++     'Stratiform rain flux at surface', 'Stratiform snow flux at surface', &
++     'Sedimenting cloud water flux at surface', 'Sedimenting cloud ice flux at surface']
++
++! MG2 tendencies, ten(:,:,j)
++character(len=10), public, parameter :: ctd_ten_name(8) = [character(len=10) :: &
++     'QCTEN', 'QINTEN', 'QRTEN', 'QSTEN', 'NCTEN', 'NINTEN', 'NRTEN', 'NSTEN']
++character(len=8), public, parameter :: ctd_ten_units(8) = [character(len=8) :: &
++     'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', '1/kg/s', '1/kg/s', '1/kg/s', '1/kg/s']
++character(len=64), public, parameter :: ctd_ten_long(8) = [character(len=64) :: &
++     'Cloud water tendency from MG2', 'Cloud ice tendency from MG2', &
++     'Rain tendency from MG2', 'Snow tendency from MG2', &
++     'Cloud droplet number tendency from MG2', 'Cloud ice number tendency from MG2', &
++     'Rain number tendency from MG2', 'Snow number tendency from MG2']
++
++! Grid-mean states for the column burdens, st(:,:,j); the column integral gets units 1/m2 or kg/m2
++character(len=10), public, parameter :: ctd_st_name(8) = [character(len=10) :: &
++     'CDNUMC', 'ICNUMC', 'SCNUMC', 'RDNUMC', 'CDMASS', 'ICMASS', 'SCMASS', 'RDMASS']
++character(len=8), public, parameter :: ctd_st_units(8) = [character(len=8) :: &
++     '1/kg', '1/kg', '1/kg', '1/kg', 'kg/kg', 'kg/kg', 'kg/kg', 'kg/kg']
++character(len=64), public, parameter :: ctd_st_long(8) = [character(len=64) :: &
++     'Vertically-integrated grid-mean cloud droplet number', &
++     'Vertically-integrated grid-mean cloud ice number', &
++     'Vertically-integrated grid-mean snow number', &
++     'Vertically-integrated grid-mean rain drop number', &
++     'Vertically-integrated grid-mean cloud water mass', &
++     'Vertically-integrated grid-mean cloud ice mass', &
++     'Vertically-integrated grid-mean snow mass', &
++     'Vertically-integrated grid-mean rain mass']
++
++! Rates outside MG2 ("ext" table), rates%ext(:,:,j) [kg/kg/s or 1/kg/s], grid-mean, with the model's own
++! tendency sign (+ = gain of the named species; RCMTEND < 0 means net evaporation). Slices 1-10 are written
++! by clubb_tend_cam (ptend_loc before/after the iceadj step and the detrainment block), 11-16 by zm_conv_tend.
++! Paths get the same <VAR>_PATH, _PATH_C/_M/_W and <VAR>_CTT_T<j> families as the MG2 rates.
++integer, public, parameter :: ctd_next = 16, ctd_nsfx = 2
++integer, public, parameter :: ctd_ix_rvmtend = 1, ctd_ix_rcmtend = 2, ctd_ix_rimtend = 3, &
++     ctd_ix_qvtendice = 4, ctd_ix_qctendice = 5, ctd_ix_nctendice = 6, &
++     ctd_ix_dpdlfliq = 7, ctd_ix_dpdlfice = 8, ctd_ix_dpdlfnl = 9, ctd_ix_dpdlfni = 10, &
++     ctd_ix_zmdq = 11, ctd_ix_evapqzm = 12, ctd_ix_zmntprpd = 13, ctd_ix_zmntsnpd = 14, &
++     ctd_ix_zmdliq = 15, ctd_ix_zmdice = 16
++character(len=10), public, parameter :: ctd_ext_name(ctd_next) = [character(len=10) :: &
++     'RVMTEND', 'RCMTEND', 'RIMTEND', 'QVTENDICE', 'QCTENDICE', 'NCTENDICE', &
++     'DPDLFLIQ', 'DPDLFICE', 'DPDLFNL', 'DPDLFNI', &
++     'ZMDQ', 'EVAPQZM', 'ZMNTPRPD', 'ZMNTSNPD', 'ZMDLIQ', 'ZMDICE']
++character(len=8), public, parameter :: ctd_ext_units(ctd_next) = [character(len=8) :: &
++     'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', '1/kg/s', &
++     'kg/kg/s', 'kg/kg/s', '1/kg/s', '1/kg/s', &
++     'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s', 'kg/kg/s']
++character(len=64), public, parameter :: ctd_ext_long(ctd_next) = [character(len=64) :: &
++     'CLUBB water vapour tendency (- = condensation)', &
++     'CLUBB cloud water tendency, before iceadj and detrainment', &
++     'CLUBB cloud ice tendency (turbulent transport)', &
++     'Vapour tendency of the CLUBB saturation adjustment (iceadj)', &
++     'Cloud water tendency of the CLUBB saturation adjustment (iceadj)', &
++     'Droplet number tendency of the CLUBB saturation adjustment', &
++     'Detrained convective cloud water (dlf*(1-dum1))', &
++     'Detrained convective cloud ice (dlf*dum1)', &
++     'Detrained convective droplet number', &
++     'Detrained convective ice number', &
++     'ZM water vapour tendency', &
++     'ZM vapour gain from evaporation of convective precipitation', &
++     'ZM net precipitation production', &
++     'ZM net snow production', &
++     'ZM convective transport of cloud water (convtran1)', &
++     'ZM convective transport of cloud ice (convtran1)']
++! ZM surface fluxes, rates%ext_sfc(:,j) [kg/m2/s] (flxprec/flxsnow at pverp); binned like RFLX_SFC, no regime split
++character(len=10), public, parameter :: ctd_extsfc_name(ctd_nsfx) = [character(len=10) :: 'ZMPRC_SFC', 'ZMSNW_SFC']
++character(len=64), public, parameter :: ctd_extsfc_long(ctd_nsfx) = [character(len=64) :: &
++     'ZM convective precipitation flux at surface', 'ZM convective snow flux at surface']
++
++type ctd_rates_t
++   real(r8), pointer :: val(:,:,:) => null()     ! (pcols,pver,ctd_nrates)
++   real(r8), pointer :: sfc_flux(:,:) => null()  ! (pcols,4)
++   real(r8), pointer :: ten(:,:,:) => null()     ! (pcols,pver,8)
++   real(r8), pointer :: st(:,:,:) => null()      ! (pcols,pver,8)
++   real(r8), pointer :: ext(:,:,:) => null()     ! (pcols,pver,ctd_next) -> pbuf CTD_EXT, not owned
++   real(r8), pointer :: ext_sfc(:,:) => null()   ! (pcols,ctd_nsfx)      -> pbuf CTD_EXT_SFC, not owned
++end type ctd_rates_t
++
++contains
++
++!=================================================================================
++
++subroutine ctd_rates_fill(rates, ncol, &
++     prco, prao, mnuccco, mnuccto, homoo, msacwio, psacwso, bergo, bergso, &
++     prcio, praio, mnuccdg, mnudep, cmeiout, qireso, qcreso, qvres, cmeout, &
++     pracso, mnuccro, mnuccri, frzrdt, meltsdt, melto, nevapr, evapsnow, &
++     qcsevap, qisevap, prer_evap, qcsedten, qisedten, qrsedten, qssedten, &
++     nnuccc, nnucct, nnudep, &
++     rflx, sflx, lflx, iflx, &
++     qcten, qiten, qrten, qsten, ncten, niten, nrten, nsten, &
++     qc, qi, qs, qr, nc, ni, ns, nr)
++
++   ! All inputs are grid-box MG2 outputs on (pcols,pver) (fluxes on pverp).
++   type(ctd_rates_t), intent(inout) :: rates
++   integer,  intent(in) :: ncol
++   real(r8), intent(in), dimension(:,:) :: &
++        prco, prao, mnuccco, mnuccto, homoo, msacwio, psacwso, bergo, bergso, &
++        prcio, praio, mnuccdg, mnudep, cmeiout, qireso, qcreso, qvres, cmeout, &
++        pracso, mnuccro, mnuccri, frzrdt, meltsdt, melto, nevapr, evapsnow, &
++        qcsevap, qisevap, prer_evap, qcsedten, qisedten, qrsedten, qssedten, &
++        nnuccc, nnucct, nnudep, &
++        rflx, sflx, lflx, iflx, &
++        qcten, qiten, qrten, qsten, ncten, niten, nrten, nsten, &
++        qc, qi, qs, qr, nc, ni, ns, nr
++
++   if (.not. associated(rates%val)) then
++      allocate(rates%val(pcols,pver,ctd_nrates), rates%sfc_flux(pcols,4), &
++               rates%ten(pcols,pver,8), rates%st(pcols,pver,8))
++   end if
++   rates%val = 0._r8
++   rates%sfc_flux = 0._r8
++   rates%ten = 0._r8
++   rates%st = 0._r8
++
++   rates%val(:ncol,:,1)  = prco(:ncol,:pver)
++   rates%val(:ncol,:,2)  = prao(:ncol,:pver)
++   rates%val(:ncol,:,3)  = mnuccco(:ncol,:pver)
++   rates%val(:ncol,:,4)  = mnuccto(:ncol,:pver)
++   rates%val(:ncol,:,5)  = homoo(:ncol,:pver)
++   rates%val(:ncol,:,6)  = msacwio(:ncol,:pver)
++   rates%val(:ncol,:,7)  = psacwso(:ncol,:pver)
++   rates%val(:ncol,:,8)  = bergo(:ncol,:pver)
++   rates%val(:ncol,:,9)  = bergso(:ncol,:pver)
++   rates%val(:ncol,:,10) = prcio(:ncol,:pver)
++   rates%val(:ncol,:,11) = praio(:ncol,:pver)
++   rates%val(:ncol,:,12) = mnuccdg(:ncol,:pver)
++   rates%val(:ncol,:,13) = mnudep(:ncol,:pver)
++   rates%val(:ncol,:,14) = cmeiout(:ncol,:pver)
++   rates%val(:ncol,:,15) = qireso(:ncol,:pver)
++   rates%val(:ncol,:,16) = qcreso(:ncol,:pver)
++   rates%val(:ncol,:,17) = -qvres(:ncol,:pver)
++   rates%val(:ncol,:,18) = cmeout(:ncol,:pver)
++   rates%val(:ncol,:,19) = pracso(:ncol,:pver)
++   rates%val(:ncol,:,20) = mnuccro(:ncol,:pver)
++   rates%val(:ncol,:,21) = mnuccri(:ncol,:pver)
++   rates%val(:ncol,:,22) = frzrdt(:ncol,:pver)/latice
++   rates%val(:ncol,:,23) = -meltsdt(:ncol,:pver)/latice
++   rates%val(:ncol,:,24) = melto(:ncol,:pver)
++   rates%val(:ncol,:,25) = nevapr(:ncol,:pver) - evapsnow(:ncol,:pver)
++   rates%val(:ncol,:,26) = evapsnow(:ncol,:pver)
++   rates%val(:ncol,:,27) = qcsevap(:ncol,:pver)
++   rates%val(:ncol,:,28) = qisevap(:ncol,:pver)
++   rates%val(:ncol,:,29) = prer_evap(:ncol,:pver)
++   rates%val(:ncol,:,30) = qcsedten(:ncol,:pver)
++   rates%val(:ncol,:,31) = qisedten(:ncol,:pver)
++   rates%val(:ncol,:,32) = qrsedten(:ncol,:pver)
++   rates%val(:ncol,:,33) = qssedten(:ncol,:pver)
++   rates%val(:ncol,:,34) = nnuccc(:ncol,:pver)
++   rates%val(:ncol,:,35) = nnucct(:ncol,:pver)
++   rates%val(:ncol,:,36) = nnudep(:ncol,:pver)
++
++   rates%sfc_flux(:ncol,1) = rflx(:ncol,pverp)
++   rates%sfc_flux(:ncol,2) = sflx(:ncol,pverp)
++   rates%sfc_flux(:ncol,3) = lflx(:ncol,pverp)
++   rates%sfc_flux(:ncol,4) = iflx(:ncol,pverp)
++
++   rates%ten(:ncol,:,1) = qcten(:ncol,:pver)
++   rates%ten(:ncol,:,2) = qiten(:ncol,:pver)
++   rates%ten(:ncol,:,3) = qrten(:ncol,:pver)
++   rates%ten(:ncol,:,4) = qsten(:ncol,:pver)
++   rates%ten(:ncol,:,5) = ncten(:ncol,:pver)
++   rates%ten(:ncol,:,6) = niten(:ncol,:pver)
++   rates%ten(:ncol,:,7) = nrten(:ncol,:pver)
++   rates%ten(:ncol,:,8) = nsten(:ncol,:pver)
++
++   rates%st(:ncol,:,1) = nc(:ncol,:pver)
++   rates%st(:ncol,:,2) = ni(:ncol,:pver)
++   rates%st(:ncol,:,3) = ns(:ncol,:pver)
++   rates%st(:ncol,:,4) = nr(:ncol,:pver)
++   rates%st(:ncol,:,5) = qc(:ncol,:pver)
++   rates%st(:ncol,:,6) = qi(:ncol,:pver)
++   rates%st(:ncol,:,7) = qs(:ncol,:pver)
++   rates%st(:ncol,:,8) = qr(:ncol,:pver)
++
++end subroutine ctd_rates_fill
++
++!=================================================================================
++
++subroutine ctd_rates_free(rates)
++
++   type(ctd_rates_t), intent(inout) :: rates
++
++   if (associated(rates%val)) deallocate(rates%val, rates%sfc_flux, rates%ten, rates%st)
++   nullify(rates%val, rates%sfc_flux, rates%ten, rates%st, rates%ext, rates%ext_sfc)   ! ext slices belong to the pbuf
++
++end subroutine ctd_rates_free
++
++!=================================================================================
++
++! Look up the CTD_EXT pbuf indices and zero both fields once at init (physpkg scope, so every run
++! starts from zero; writers then overwrite their whole slice every step or substep).
++subroutine ctd_ext_init(pbuf2d)
++
++   use physics_buffer, only: physics_buffer_desc, pbuf_get_index, pbuf_set_field
++
++   type(physics_buffer_desc), pointer :: pbuf2d(:,:)
++
++   ext_idx     = pbuf_get_index(ctd_pbuf_ext)
++   ext_sfc_idx = pbuf_get_index(ctd_pbuf_ext_sfc)
++   call pbuf_set_field(pbuf2d, ext_idx,     0._r8)
++   call pbuf_set_field(pbuf2d, ext_sfc_idx, 0._r8)
++
++end subroutine ctd_ext_init
++
++!=================================================================================
++
++! Copy one layer rate into slice ix of CTD_EXT (columns > ncol untouched, levels all). No-op if not registered.
++subroutine ctd_ext_put(pbuf, ix, ncol, field)
++
++   use physics_buffer, only: physics_buffer_desc, pbuf_get_field
++
++   type(physics_buffer_desc), pointer    :: pbuf(:)
++   integer,                   intent(in) :: ix, ncol
++   real(r8),                  intent(in) :: field(:,:)   ! (>=ncol, pver)
++
++   real(r8), pointer :: ext(:,:,:)
++
++   if (ext_idx < 0) return
++   call pbuf_get_field(pbuf, ext_idx, ext)
++   ext(:ncol,:,ix) = field(:ncol,:pver)
++
++end subroutine ctd_ext_put
++
++!=================================================================================
++
++! Copy the two ZM surface fluxes (kg/m2/s) into CTD_EXT_SFC. No-op if not registered.
++subroutine ctd_ext_sfc_put(pbuf, ncol, fprc, fsnw)
++
++   use physics_buffer, only: physics_buffer_desc, pbuf_get_field
++
++   type(physics_buffer_desc), pointer    :: pbuf(:)
++   integer,                   intent(in) :: ncol
++   real(r8),                  intent(in) :: fprc(:), fsnw(:)
++
++   real(r8), pointer :: sfc(:,:)
++
++   if (ext_sfc_idx < 0) return
++   call pbuf_get_field(pbuf, ext_sfc_idx, sfc)
++   sfc(:ncol,1) = fprc(:ncol)
++   sfc(:ncol,2) = fsnw(:ncol)
++
++end subroutine ctd_ext_sfc_put
++
++!=================================================================================
++
++! Point rates%ext / rates%ext_sfc at the pbuf fields (no copy); left unassociated if not registered.
++subroutine ctd_ext_get(pbuf, rates)
++
++   use physics_buffer, only: physics_buffer_desc, pbuf_get_field
++
++   type(physics_buffer_desc), pointer       :: pbuf(:)
++   type(ctd_rates_t),         intent(inout) :: rates
++
++   if (ext_idx < 0 .or. ext_sfc_idx < 0) return
++   call pbuf_get_field(pbuf, ext_idx, rates%ext)
++   call pbuf_get_field(pbuf, ext_sfc_idx, rates%ext_sfc)
++
++end subroutine ctd_ext_get
++
++end module cloud_top_diag_rates

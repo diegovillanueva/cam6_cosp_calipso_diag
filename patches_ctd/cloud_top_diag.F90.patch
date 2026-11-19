@@ -1,0 +1,1103 @@
+diff --git a/src/physics/cam/cloud_top_diag.F90 b/src/physics/cam/cloud_top_diag.F90
+new file mode 100644
+index 0000000..9c0f7c8
+--- /dev/null
++++ b/src/physics/cam/cloud_top_diag.F90
+@@ -0,0 +1,1097 @@
++module cloud_top_diag
++
++!---------------------------------------------------------------------------------
++! Purpose:
++!   In-model cloud-top diagnostics (replaces the offline stratify_ctt.sh pipeline).
++!   - cloud top per threshold j (grid-mean qc+qi > ctd_qthr(j)): CTT/CTP/CVF/ILF/ISLF_T<j>
++!   - column paths of every MG2 rate, tendency and number/mass: <VAR>_PATH,
++!     split by layer temperature into _C (T<234.15 K), _M, _W (T>=273.15 K)
++!   - the same paths and cloud fields binned on cloud-top temperature
++!     (history coordinate ctt_bin): <VAR>_CTT_T<j>, CVF_CTT_T<j>, ...
++!   - layer-temperature-binned water paths TWP_TB, TCP_TB, ICP_TB, IWP_TB
++!   All fields are grid-mean. Binned fields are zero outside the bin of the
++!   current cloud top, so time-mean(X_CTT_T<j>)/time-mean(CVF_CTT_T<j>) is the
++!   conditional mean per cloud-top temperature. ctd_on=.false. (default) does nothing.
++!
++! Author: Diego Villanueva
++!
++!---------------------------------------------------------------------------------
++
++use shr_kind_mod,         only: r8=>shr_kind_r8
++use spmd_utils,           only: masterproc, mpicom, masterprocid, mpi_logical, mpi_real8, mpi_integer
++use ppgrid,               only: pcols, pver
++use cam_logfile,          only: iulog
++use cam_abortutils,       only: endrun
++use cloud_top_diag_rates, only: ctd_nrates, ctd_rate_name, ctd_rate_units, ctd_rate_long, ctd_rates_t
++use cloud_top_diag_rates, only: ctd_next, ctd_ext_name, ctd_ext_units, ctd_ext_long, &
++                                ctd_nsfx, ctd_extsfc_name, ctd_extsfc_long
++
++implicit none
++private
++save
++
++public :: cloud_top_diag_readnl, cloud_top_diag_register, cloud_top_diag_init, cloud_top_diag_run
++! Shared helpers for the other ctd modules (ctd_water_budget, binned 2-D fields): same thresholds, bins and regimes.
++public :: bin_of, ctd_regime, ctd_find_top, nthr, nreg, reg_sfx, thr_sfx, t_cold, t_melt
++! h0 defaults (WP4): explicit registry helper and the catch-all walk over every 'CTD:' long_name.
++public :: ctd_addfld_default, ctd_default_all
++! binned copy of a 2-D field written outside MG2 (radiation, cloud_diagnostics, diag_conv, MG2 post).
++public :: cloud_top_diag_bin2d
++! COSPTOP A2: MG2 cloud-top bin (pbuf CTD_IBIN at T<ctd_combo_thr>) for the COSP lidar-top phase fields.
++public :: ctd_cosp_top_ibin
++
++! Namelist cloud_top_diag_nl
++logical,  public :: ctd_on             = .false.
++real(r8), public :: ctd_qthr(3)        = (/ 1.e-7_r8, 1.e-6_r8, 1.e-5_r8 /)  ! kg/kg on grid-mean qc+qi
++logical,  public :: ctd_mask_incl_snow = .false.    ! add qs to the cloud-top mask
++real(r8), public :: ctd_ctt_bin0       = 180._r8    ! lower edge of the first ctt_bin [K]
++real(r8), public :: ctd_dbin           = 3._r8      ! bin width [K]
++integer,  public :: ctd_nbin           = 40
++integer,  public :: ctd_h0_default     = 3         ! add_default level on h0 when ctd_on: 0 none, 1 2-D fields, 2 +T<ctd_combo_thr> bins and *_TB, 3 everything
++integer,  public :: ctd_combo_thr      = 5         ! threshold exponent used by the combined <VAR>_<R>_CTT_T<j> family (and level 2 bins)
++
++integer, parameter :: nthr = 3
++integer, parameter :: nreg = 3                      ! C, M, W
++real(r8), parameter :: t_cold = 234.15_r8, t_melt = 273.15_r8
++character(len=1), parameter :: reg_sfx(nreg) = (/ 'C', 'M', 'W' /)
++
++! Path list = MG2 rates + 8 tendencies + 8 number/mass (all layer integrals),
++! plus 4 surface fluxes (binned only, no regime split).
++integer, parameter :: nten = 8, nnm = 8, nsfc0 = 4, nsfc = nsfc0 + ctd_nsfx
++integer, parameter :: next0 = ctd_nrates + nten + nnm   ! offset of the ext rates in the path list
++character(len=6), parameter :: ten_name(nten) = (/ 'QCTEN ', 'QINTEN', 'QRTEN ', 'QSTEN ', &
++                                                   'NCTEN ', 'NINTEN', 'NRTEN ', 'NSTEN ' /)
++character(len=6), parameter :: nm_name(nnm) = (/ 'CDNUMC', 'ICNUMC', 'SCNUMC', 'RDNUMC', &
++                                                 'CDMASS', 'ICMASS', 'SCMASS', 'RDMASS' /)
++character(len=6), parameter :: nm_cnst(nnm) = (/ 'NUMLIQ', 'NUMICE', 'NUMSNO', 'NUMRAI', &
++                                                 'CLDLIQ', 'CLDICE', 'SNOWQM', 'RAINQM' /)
++! 2-D surface-flux names; the binned name is trim(sfc_name)//'_CTT_T<j>' (MG2 4 + ZM ctd_nsfx)
++character(len=10), parameter :: sfc_name(nsfc) = [character(len=10) :: &
++     'RFLX_SFC', 'SFLX_SFC', 'LFLX_SFC', 'IFLX_SFC', ctd_extsfc_name]
++integer, parameter :: ncfld = 8
++character(len=6), parameter :: cfld_name(ncfld) = (/ 'CVF   ', 'CVFLIQ', 'CVFICE', 'TWP   ', &
++                                                     'IWP   ', 'TCP   ', 'ILF   ', 'ISLF  ' /)
++integer, parameter :: ntb = 4
++character(len=3), parameter :: tb_name(ntb) = (/ 'TWP', 'TCP', 'ICP', 'IWP' /)
++
++integer :: npath                                    ! ctd_nrates + nten + nnm + ctd_next
++character(len=16), allocatable :: path_name(:)      ! base name <VAR>
++integer :: inm(nnm)                                 ! constituent indices for number/mass
++integer :: ixcldliq, ixcldice, ixsnow
++character(len=2) :: thr_sfx(nthr)                   ! '7','6','5'
++real(r8), allocatable, target :: ctt_mid(:), ctt_bnds(:,:)
++
++! hist_fld_active flags, cached on the first run call (history is set up by then)
++logical :: act_cached = .false.
++
++! add_default registry of ctd_addfld_default (name, level); levels as ctd_h0_default.
++integer, parameter :: reg_len = 32
++integer :: ndef = 0
++character(len=reg_len), allocatable :: def_name(:)
++integer, allocatable :: def_level(:)
++logical :: act_top(5, nthr)                          ! CTT CTP CVF ILF ISLF
++logical, allocatable :: act_path(:), act_reg(:,:), act_bin(:,:), act_sfcb(:,:)
++logical :: act_sfc(nsfc), act_cbin(ncfld, nthr), act_tb(ntb)
++
++! combined regime x cloud-top family, cloud-top extras, layer-T extras, binned 2-D fields
++! PRACSO..QSTEN close the rain/snow partition per layer regime and cloud-top bin.
++integer, parameter :: ncombo = 23
++character(len=10), parameter :: combo_name(ncombo) = [character(len=10) :: &
++     'PRCO', 'PRAO', 'PSACWSO', 'BERGO', 'BERGSO', 'PRCIO', 'PRAIO', 'MNUCCCO', &
++     'CMEIOUT', 'MELTO', 'QCTEN', 'QINTEN', 'TWP', 'IWP', 'RCMTEND', 'DPDLFLIQ', 'DPDLFICE', &
++     'PRACSO', 'MNUCCRO', 'EVPRAIN_ST', 'EVPSNOW_ST', 'QRTEN', 'QSTEN' ]
++integer :: combo_ix(ncombo) = 0                     ! path index; -1 TWP, -2 IWP, 0 not available (skipped)
++integer :: jcombo = 0                               ! threshold index with exponent ctd_combo_thr, 0 if none
++integer, parameter :: ntopx = 9
++character(len=4), parameter :: topx_name(ntopx) = [character(len=4) :: &
++     'CTH', 'CTQC', 'CTQI', 'CTNC', 'CTNI', 'CBP', 'NLAY', 'MPC', 'CTTS' ]
++integer, parameter :: ntbx = 2
++character(len=3), parameter :: tbx_name(ntbx) = [character(len=3) :: 'DP', 'CLD']
++integer, parameter :: nb2d = 12
++character(len=8), parameter :: b2d_name(nb2d) = [character(len=8) :: &
++     'LWCF', 'SWCF', 'FLNT', 'FSNT', 'FLNTC', 'FSNTC', 'TGCLDLWP', 'TGCLDIWP', 'PRECT', 'PRECC', 'ACTNL', 'ACTNI' ]
++character(len=8), parameter :: b2d_units(nb2d) = [character(len=8) :: &
++     'W/m2', 'W/m2', 'W/m2', 'W/m2', 'W/m2', 'W/m2', 'kg/m2', 'kg/m2', 'm/s', 'm/s', 'm-3', 'm-3' ]
++integer :: ibin_idx = -1, cld_idx = -1               ! pbuf CTD_IBIN (written here), CLD (read)
++logical :: top_cached = .false., b2d_cached = .false.
++logical :: act_combo(ncombo, nreg) = .false., act_topx(ntopx, nthr) = .false.
++logical :: act_mpcb(nthr) = .false., act_tbx(ntbx) = .false., act_b2d(nb2d) = .false.
++
++!=========================================================================================
++contains
++!=========================================================================================
++
++subroutine cloud_top_diag_readnl(nlfile)
++
++   use namelist_utils,  only: find_group_name
++   use units,           only: getunit, freeunit
++
++   character(len=*), intent(in) :: nlfile  ! filepath for file containing namelist input
++
++   ! Local variables
++   integer :: unitn, ierr
++   character(len=*), parameter :: subname = 'cloud_top_diag_readnl'
++
++   namelist /cloud_top_diag_nl/ ctd_on, ctd_qthr, ctd_mask_incl_snow, ctd_ctt_bin0, ctd_dbin, ctd_nbin, &
++        ctd_h0_default, ctd_combo_thr
++   !-----------------------------------------------------------------------------
++
++   if (masterproc) then
++      unitn = getunit()
++      open( unitn, file=trim(nlfile), status='old' )
++      call find_group_name(unitn, 'cloud_top_diag_nl', status=ierr)
++      if (ierr == 0) then
++         read(unitn, cloud_top_diag_nl, iostat=ierr)
++         if (ierr /= 0) then
++            call endrun(subname // ':: ERROR reading namelist')
++         end if
++      end if
++      close(unitn)
++      call freeunit(unitn)
++   end if
++
++   ! Broadcast namelist variables
++   call mpi_bcast(ctd_on,             1,    mpi_logical, masterprocid, mpicom, ierr)
++   call mpi_bcast(ctd_qthr,           nthr, mpi_real8,   masterprocid, mpicom, ierr)
++   call mpi_bcast(ctd_mask_incl_snow, 1,    mpi_logical, masterprocid, mpicom, ierr)
++   call mpi_bcast(ctd_ctt_bin0,       1,    mpi_real8,   masterprocid, mpicom, ierr)
++   call mpi_bcast(ctd_dbin,           1,    mpi_real8,   masterprocid, mpicom, ierr)
++   call mpi_bcast(ctd_nbin,           1,    mpi_integer, masterprocid, mpicom, ierr)
++   call mpi_bcast(ctd_h0_default,     1,    mpi_integer, masterprocid, mpicom, ierr)
++   call mpi_bcast(ctd_combo_thr,      1,    mpi_integer, masterprocid, mpicom, ierr)
++
++   if (ctd_on .and. (ctd_nbin < 1 .or. ctd_dbin <= 0._r8 .or. any(ctd_qthr <= 0._r8))) then
++      call endrun(subname // ':: ctd_nbin, ctd_dbin and ctd_qthr must be positive')
++   end if
++
++   if (masterproc) then
++      write(iulog,*) ' ctd_on             = ', ctd_on
++      write(iulog,*) ' ctd_qthr           = ', ctd_qthr
++      write(iulog,*) ' ctd_mask_incl_snow = ', ctd_mask_incl_snow
++      write(iulog,*) ' ctd_ctt_bin0       = ', ctd_ctt_bin0
++      write(iulog,*) ' ctd_dbin           = ', ctd_dbin
++      write(iulog,*) ' ctd_nbin           = ', ctd_nbin
++      write(iulog,*) ' ctd_h0_default     = ', ctd_h0_default
++      write(iulog,*) ' ctd_combo_thr      = ', ctd_combo_thr
++   end if
++
++end subroutine cloud_top_diag_readnl
++
++!=========================================================================================
++
++subroutine cloud_top_diag_register()
++
++   ! The ctt_bin history coordinate must exist before read_restart_history, which runs
++   ! before the physics init phase; registered later, a restart aborts with
++   ! "set_field_dimensions: mdim size must be > 0".
++   use cam_history_support, only: add_hist_coord
++
++   integer :: b
++
++   if (.not. ctd_on) return
++   allocate(ctt_mid(ctd_nbin), ctt_bnds(2, ctd_nbin))
++   do b = 1, ctd_nbin
++      ctt_bnds(1,b) = ctd_ctt_bin0 + (b-1)*ctd_dbin
++      ctt_bnds(2,b) = ctt_bnds(1,b) + ctd_dbin
++      ctt_mid(b)    = 0.5_r8*(ctt_bnds(1,b) + ctt_bnds(2,b))
++   end do
++   call add_hist_coord('ctt_bin', ctd_nbin, 'cloud-top (or layer) temperature bin', 'K', &
++        ctt_mid, bounds_name='ctt_bin_bnds', bounds=ctt_bnds)
++
++end subroutine cloud_top_diag_register
++
++!=========================================================================================
++
++subroutine cloud_top_diag_init()
++
++   use cam_history,         only: addfld, horiz_only
++   use constituents,        only: cnst_get_ind
++
++   integer :: j, p, r, b
++   character(len=64)  :: pu, bu
++   character(len=128) :: ln
++   character(len=24)  :: thr_txt
++
++   if (.not. ctd_on) return
++
++   do j = 1, nthr
++      write(thr_sfx(j), '(i0)') nint(-log10(ctd_qthr(j)))
++   end do
++   ! Field names carry the exponent only, so thresholds with the same decade would collide in addfld.
++   if (thr_sfx(1) == thr_sfx(2) .or. thr_sfx(1) == thr_sfx(3) .or. thr_sfx(2) == thr_sfx(3)) &
++        call endrun('cloud_top_diag_init:: ctd_qthr must have three distinct decades (field suffix T<exponent>)')
++
++   call cnst_get_ind('CLDLIQ', ixcldliq)
++   call cnst_get_ind('CLDICE', ixcldice)
++   call cnst_get_ind('SNOWQM', ixsnow)
++   do p = 1, nnm
++      call cnst_get_ind(trim(nm_cnst(p)), inm(p))
++   end do
++
++   npath = next0 + ctd_next
++   allocate(path_name(npath))
++   path_name(1:ctd_nrates) = ctd_rate_name
++   path_name(ctd_nrates+1:ctd_nrates+nten) = ten_name
++   path_name(ctd_nrates+nten+1:next0) = nm_name
++   path_name(next0+1:npath) = ctd_ext_name
++
++
++   !== section: top/bins ==========================================
++   ! Cloud top per threshold
++   do j = 1, nthr
++      write(thr_txt, '(a,es7.1,a)') 'qc+qi > ', ctd_qthr(j), ' kg/kg'
++      call addfld('CTT_T'//trim(thr_sfx(j)), horiz_only, 'A', 'K', &
++           'CTD:TOP | Cloud-top temperature, grid-mean '//trim(thr_txt), flag_xyfill=.true.)
++      call addfld('CTP_T'//trim(thr_sfx(j)), horiz_only, 'A', 'Pa', &
++           'CTD:TOP | Cloud-top pressure, grid-mean '//trim(thr_txt), flag_xyfill=.true.)
++      call addfld('CVF_T'//trim(thr_sfx(j)), horiz_only, 'A', '1', &
++           'CTD:TOP | Cloud-top occurrence (0/1), grid-mean '//trim(thr_txt))
++      call addfld('ILF_T'//trim(thr_sfx(j)), horiz_only, 'A', '1', &
++           'CTD:TOP | Ice mass fraction qi/(qc+qi) in the cloud-top layer, '//trim(thr_txt), flag_xyfill=.true.)
++      call addfld('ISLF_T'//trim(thr_sfx(j)), horiz_only, 'A', '1', &
++           'CTD:TOP | Ice+snow mass fraction at the snow-inclusive cloud top, qc+qi+qs threshold', flag_xyfill=.true.)
++
++      call addfld('CVF_CTT_T'//trim(thr_sfx(j)), (/'ctt_bin'/), 'A', '1', &
++           'CTD:TOPBIN | Cloud-top occurrence per CTT bin, '//trim(thr_txt))
++      call addfld('CVFLIQ_CTT_T'//trim(thr_sfx(j)), (/'ctt_bin'/), 'A', '1', &
++           'CTD:TOPBIN | Cloud-top occurrence x (1-ILF) per CTT bin, '//trim(thr_txt))
++      call addfld('CVFICE_CTT_T'//trim(thr_sfx(j)), (/'ctt_bin'/), 'A', '1', &
++           'CTD:TOPBIN | Cloud-top occurrence x ILF per CTT bin, '//trim(thr_txt))
++      call addfld('TWP_CTT_T'//trim(thr_sfx(j)), (/'ctt_bin'/), 'A', 'kg/m2', &
++           'CTD:TOPBIN | Column qc+qi path per CTT bin, '//trim(thr_txt))
++      call addfld('IWP_CTT_T'//trim(thr_sfx(j)), (/'ctt_bin'/), 'A', 'kg/m2', &
++           'CTD:TOPBIN | Column qi path per CTT bin, '//trim(thr_txt))
++      call addfld('TCP_CTT_T'//trim(thr_sfx(j)), (/'ctt_bin'/), 'A', 'kg/m2', &
++           'CTD:TOPBIN | Column qc+qi+qs path per CTT bin, '//trim(thr_txt))
++      call addfld('ILF_CTT_T'//trim(thr_sfx(j)), (/'ctt_bin'/), 'A', '1', &
++           'CTD:TOPBIN | Cloud-top ILF per CTT bin (divide by CVF_CTT), '//trim(thr_txt))
++      call addfld('ISLF_CTT_T'//trim(thr_sfx(j)), (/'ctt_bin'/), 'A', '1', &
++           'CTD:TOPBIN | ISLF per CTT bin (divide by CVF_CTT), '//trim(thr_txt))
++   end do
++
++   !== section: paths (WP1 cl-ext) =============================================
++   ! Paths, regime split and CTT-binned paths
++   do p = 1, npath
++      call path_meta(p, pu, ln)
++      ! CDNUMC (grid-mean droplet column) is already registered and written by micro_mg_cam; only its regime split is new.
++      if (.not. stock_field(p)) call addfld(trim(p2d_name(p)), horiz_only, 'A', trim(pu), &
++           trim(path_grp(p, .false.))//' Column-integrated '//trim(ln))
++      do r = 1, nreg
++         call addfld(trim(p2d_name(p))//'_'//reg_sfx(r), horiz_only, 'A', trim(pu), &
++              trim(path_grp(p, .false.))//' Column-integrated '//trim(ln)//', layers '//reg_txt(r))
++      end do
++      do j = 1, nthr
++         call addfld(trim(path_name(p))//'_CTT_T'//trim(thr_sfx(j)), (/'ctt_bin'/), 'A', trim(pu), &
++              trim(path_grp(p, .true.))//' Column-integrated '//trim(ln)//' per CTT bin, threshold '//trim(thr_sfx(j)))
++      end do
++   end do
++
++   do p = 1, nsfc
++      bu = 'kg/m2/s'
++      if (p <= nsfc0) then
++         ln = 'CTD:MG2SFC | MG2 '//sfc_name(p)(1:4)//' at the surface'
++      else
++         ln = 'CTD:EXTSFC | '//trim(ctd_extsfc_long(p-nsfc0))
++      end if
++      call addfld(trim(sfc_name(p)), horiz_only, 'A', trim(bu), trim(ln))
++      do j = 1, nthr
++         call addfld(trim(sfc_name(p))//'_CTT_T'//trim(thr_sfx(j)), (/'ctt_bin'/), 'A', trim(bu), &
++              trim(ln)//' per CTT bin, threshold '//trim(thr_sfx(j)))
++      end do
++   end do
++
++   !== section: top/bins ==========================================
++   ! Layer-temperature-binned paths (threshold independent)
++   call addfld('TWP_TB', (/'ctt_bin'/), 'A', 'kg/m2', 'CTD:TB | qc+qi path of layers with T in bin')
++   call addfld('TCP_TB', (/'ctt_bin'/), 'A', 'kg/m2', 'CTD:TB | qc+qi+qs path of layers with T in bin')
++   call addfld('ICP_TB', (/'ctt_bin'/), 'A', 'kg/m2', 'CTD:TB | qi+qs path of layers with T in bin')
++   call addfld('IWP_TB', (/'ctt_bin'/), 'A', 'kg/m2', 'CTD:TB | qi path of layers with T in bin')
++   call ctd_top_init()
++
++   !== section: history defaults (WP4 cl-hist): ctd_add_defaults() goes here, after every addfld ==
++   ! Every 'CTD:' field registered so far goes on h0 up to ctd_h0_default; micro_mg_cam_init calls
++   ! ctd_default_all() again after ctd_wb_init so the budget fields are covered too (add_default is idempotent).
++   call ctd_default_all()
++
++contains
++
++   function path_grp(p, binned) result(g)
++      ! Group token of path p: MG2 rates, MG2 tendencies, number/mass stocks, beyond them the ext table.
++      integer, intent(in) :: p
++      logical, intent(in) :: binned
++      character(len=16) :: g
++      if (p > ctd_nrates + nten + nnm) then
++         g = 'CTD:EXTRATE |'
++         if (binned) g = 'CTD:EXTBIN |'
++      else if (binned) then
++         g = 'CTD:MG2BIN |'
++      else if (p <= ctd_nrates) then
++         g = 'CTD:MG2RATE |'
++      else if (p <= ctd_nrates + nten) then
++         g = 'CTD:MG2TEND |'
++      else
++         g = 'CTD:MG2STOCK |'
++      end if
++   end function path_grp
++
++   function reg_txt(r) result(t)
++      integer, intent(in) :: r
++      character(len=24) :: t
++      select case (r)
++      case (1); t = 'T < 234.15 K'
++      case (2); t = '234.15 <= T < 273.15 K'
++      case default; t = 'T >= 273.15 K'
++      end select
++   end function reg_txt
++
++end subroutine cloud_top_diag_init
++
++!=========================================================================================
++
++subroutine ctd_top_init()
++
++   ! addflds: layer-T extras, cloud-top extras, combined family, binned 2-D fields.
++   use cam_history,         only: addfld, horiz_only
++   use physics_buffer,      only: pbuf_get_index
++   use cloud_top_diag_rates, only: ctd_pbuf_ibin
++
++   integer :: j, n, p, r
++   character(len=2)   :: cs
++   character(len=64)  :: pu
++   character(len=128) :: ln
++   character(len=24)  :: thr_txt
++   character(len=48)  :: rtxt(nreg)
++
++   rtxt = [character(len=48) :: 'layers T < 234.15 K', 'layers 234.15 <= T < 273.15 K', 'layers T >= 273.15 K']
++
++   call addfld('DP_TB', (/'ctt_bin'/), 'A', 'kg/m2', 'CTD:TB | Air mass dp/g of layers with T in bin')
++   call addfld('CLD_TB', (/'ctt_bin'/), 'A', 'kg/m2', 'CTD:TB | Cloud fraction x dp/g of layers with T in bin')
++
++   do j = 1, nthr
++      write(thr_txt, '(a,es7.1,a)') 'qc+qi > ', ctd_qthr(j), ' kg/kg'
++      cs = trim(thr_sfx(j))
++      call addfld('CTH_T'//trim(cs), horiz_only, 'A', 'm', &
++           'CTD:TOP | Cloud-top height above surface (zm), '//trim(thr_txt), flag_xyfill=.true.)
++      call addfld('CTQC_T'//trim(cs), horiz_only, 'A', 'kg/kg', &
++           'CTD:TOP | Grid-mean qc of the cloud-top layer, '//trim(thr_txt), flag_xyfill=.true.)
++      call addfld('CTQI_T'//trim(cs), horiz_only, 'A', 'kg/kg', &
++           'CTD:TOP | Grid-mean qi of the cloud-top layer, '//trim(thr_txt), flag_xyfill=.true.)
++      call addfld('CTNC_T'//trim(cs), horiz_only, 'A', '1/kg', &
++           'CTD:TOP | Grid-mean NUMLIQ of the cloud-top layer, '//trim(thr_txt), flag_xyfill=.true.)
++      call addfld('CTNI_T'//trim(cs), horiz_only, 'A', '1/kg', &
++           'CTD:TOP | Grid-mean NUMICE of the cloud-top layer, '//trim(thr_txt), flag_xyfill=.true.)
++      call addfld('CBP_T'//trim(cs), horiz_only, 'A', 'Pa', &
++           'CTD:TOP | Base pressure (pint) of the contiguous cloud below the top, '//trim(thr_txt), flag_xyfill=.true.)
++      call addfld('NLAY_T'//trim(cs), horiz_only, 'A', '1', &
++           'CTD:TOP | Number of separate cloudy layer blocks in the column, '//trim(thr_txt))
++      call addfld('MPC_T'//trim(cs), horiz_only, 'A', '1', &
++           'CTD:TOP | Mixed-phase top (0/1): qc and qi > 0.1 x threshold, '//trim(thr_txt))
++      call addfld('CTTS_T'//trim(cs), horiz_only, 'A', 'K', &
++           'CTD:TOP | Temperature of the snow-inclusive cloud top (qc+qi+qs threshold)', flag_xyfill=.true.)
++      call addfld('MPC_CTT_T'//trim(cs), (/'ctt_bin'/), 'A', '1', &
++           'CTD:TOPBIN | Mixed-phase cloud-top occurrence per CTT bin, '//trim(thr_txt))
++      if (thr_sfx(j) == trim(adjustl(itoa(ctd_combo_thr)))) jcombo = j
++   end do
++
++   if (jcombo == 0) then
++      if (masterproc) write(iulog,*) 'cloud_top_diag: ctd_combo_thr = ', ctd_combo_thr, &
++           ' matches no threshold; combined and BIN2D families skipped'
++   else
++      cs = trim(thr_sfx(jcombo))
++      do n = 1, ncombo
++         select case (trim(combo_name(n)))
++         case ('TWP')
++            combo_ix(n) = -1; pu = 'kg/m2'; ln = 'qc+qi path'
++         case ('IWP')
++            combo_ix(n) = -2; pu = 'kg/m2'; ln = 'qi path'
++         case default
++            combo_ix(n) = 0
++            do p = 1, npath
++               if (trim(path_name(p)) == trim(combo_name(n))) combo_ix(n) = p
++            end do
++            if (combo_ix(n) == 0) then
++               if (masterproc) write(iulog,*) 'cloud_top_diag: combined family skips ', trim(combo_name(n)), &
++                    ' (not in the path table)'
++               cycle
++            end if
++            call path_meta(combo_ix(n), pu, ln)
++         end select
++         do r = 1, nreg
++            call addfld(trim(combo_name(n))//'_'//reg_sfx(r)//'_CTT_T'//trim(cs), (/'ctt_bin'/), 'A', trim(pu), &
++                 'CTD:COMBO | Column '//trim(ln)//', '//trim(rtxt(r))//', per CTT bin, threshold '//trim(cs))
++         end do
++      end do
++
++      do n = 1, nb2d
++         if (n <= 6) then
++            call addfld(trim(b2d_name(n))//'_CTT_T'//trim(cs), (/'ctt_bin'/), 'A', trim(b2d_units(n)), &
++                 'CTD:BIN2D | '//trim(b2d_name(n))//' per CTT bin (top of the last MG2 substep), threshold '//trim(cs), &
++                 sampling_seq='rad_lwsw')
++         else
++            call addfld(trim(b2d_name(n))//'_CTT_T'//trim(cs), (/'ctt_bin'/), 'A', trim(b2d_units(n)), &
++                 'CTD:BIN2D | '//trim(b2d_name(n))//' per CTT bin (top of the last MG2 substep), threshold '//trim(cs))
++         end if
++      end do
++   end if
++
++   ibin_idx = pbuf_get_index(ctd_pbuf_ibin)
++   cld_idx  = pbuf_get_index('CLD')
++
++contains
++
++   function itoa(i) result(t)
++      integer, intent(in) :: i
++      character(len=12) :: t
++      write(t, '(i0)') i
++   end function itoa
++
++end subroutine ctd_top_init
++
++!=========================================================================================
++
++subroutine cache_active_top()
++
++   ! hist_fld_active flags of the fields (first run call).
++   use cam_history, only: hist_fld_active
++
++   integer :: j, n, r
++
++   do j = 1, nthr
++      do n = 1, ntopx
++         act_topx(n,j) = hist_fld_active(trim(topx_name(n))//'_T'//trim(thr_sfx(j)))
++      end do
++      act_mpcb(j) = hist_fld_active('MPC_CTT_T'//trim(thr_sfx(j)))
++   end do
++   do n = 1, ntbx
++      act_tbx(n) = hist_fld_active(trim(tbx_name(n))//'_TB')
++   end do
++   if (jcombo > 0) then
++      do n = 1, ncombo
++         if (combo_ix(n) == 0) cycle
++         do r = 1, nreg
++            act_combo(n,r) = hist_fld_active(trim(combo_name(n))//'_'//reg_sfx(r)//'_CTT_T'//trim(thr_sfx(jcombo)))
++         end do
++      end do
++   end if
++   top_cached = .true.
++
++end subroutine cache_active_top
++
++!=========================================================================================
++
++subroutine cloud_top_diag_bin2d(name, f2d, ncol, lchnk, pbuf)
++
++   ! Write '<name>_CTT_T<ctd_combo_thr>': f2d placed in the cloud-top bin of the last
++   ! cloud_top_diag_run call of this step (pbuf CTD_IBIN), zero elsewhere. No-op when inactive.
++   use physics_buffer, only: physics_buffer_desc, pbuf_get_field
++   use cam_history,    only: outfld, hist_fld_active
++
++   character(len=*),          intent(in) :: name
++   real(r8),                  intent(in) :: f2d(:)
++   integer,                   intent(in) :: ncol, lchnk
++   type(physics_buffer_desc), pointer    :: pbuf(:)
++
++   integer  :: i, n, nf, b
++   real(r8), pointer :: ibp(:,:)
++   real(r8) :: fbin(pcols, ctd_nbin)
++
++   if (.not. ctd_on .or. jcombo == 0 .or. ibin_idx < 0) return
++   if (.not. b2d_cached) then
++      do n = 1, nb2d
++         act_b2d(n) = hist_fld_active(trim(b2d_name(n))//'_CTT_T'//trim(thr_sfx(jcombo)))
++      end do
++      b2d_cached = .true.
++   end if
++   nf = 0
++   do n = 1, nb2d
++      if (trim(b2d_name(n)) == trim(name)) nf = n
++   end do
++   if (nf == 0) return
++   if (.not. act_b2d(nf)) return
++
++   call pbuf_get_field(pbuf, ibin_idx, ibp)
++   fbin(:ncol,:) = 0._r8
++   do i = 1, ncol
++      b = nint(ibp(i,jcombo))
++      if (b >= 1 .and. b <= ctd_nbin) fbin(i,b) = f2d(i)
++   end do
++   call outfld(trim(b2d_name(nf))//'_CTT_T'//trim(thr_sfx(jcombo)), fbin, pcols, lchnk)
++
++end subroutine cloud_top_diag_bin2d
++
++!=========================================================================================
++
++subroutine ctd_cosp_top_ibin(pbuf, ncol, ib)
++
++   ! ctt_bin of the MG2 cloud top at threshold T<ctd_combo_thr> from the last cloud_top_diag_run
++   ! call of this step (pbuf CTD_IBIN), 0 for clear columns or when ctd/the combo threshold is inactive.
++   use physics_buffer, only: physics_buffer_desc, pbuf_get_field
++
++   type(physics_buffer_desc), pointer    :: pbuf(:)
++   integer,                   intent(in) :: ncol
++   integer,                   intent(out) :: ib(:)
++
++   real(r8), pointer :: ibp(:,:)
++   integer :: i
++
++   ib(:) = 0
++   if (.not. ctd_on .or. jcombo == 0 .or. ibin_idx < 0) return
++   call pbuf_get_field(pbuf, ibin_idx, ibp)
++   do i = 1, ncol
++      ib(i) = nint(ibp(i,jcombo))
++      if (ib(i) < 1 .or. ib(i) > ctd_nbin) ib(i) = 0
++   end do
++
++end subroutine ctd_cosp_top_ibin
++
++!=========================================================================================
++
++subroutine path_meta(p, units, long)
++
++   ! Units and long name of path p (mass -> kg/m2[/s], number -> 1/m2[/s]).
++   integer,          intent(in)  :: p
++   character(len=*), intent(out) :: units, long
++
++   if (p <= ctd_nrates) then
++      if (ctd_rate_units(p)(1:2) == 'kg') then
++         units = 'kg/m2/s'
++      else
++         units = '1/m2/s'
++      end if
++      long = ctd_rate_long(p)
++   else if (p <= ctd_nrates + nten) then
++      if (ten_name(p-ctd_nrates)(1:1) == 'Q') then
++         units = 'kg/m2/s'
++      else
++         units = '1/m2/s'
++      end if
++      long = 'MG2 tendency '//trim(ten_name(p-ctd_nrates))
++   else if (p > next0) then
++      if (ctd_ext_units(p-next0)(1:2) == 'kg') then
++         units = 'kg/m2/s'
++      else
++         units = '1/m2/s'
++      end if
++      long = ctd_ext_long(p-next0)
++   else
++      if (p - ctd_nrates - nten <= 4) then
++         units = '1/m2'
++      else
++         units = 'kg/m2'
++      end if
++      long = 'grid-mean '//trim(nm_cnst(p-ctd_nrates-nten))
++   end if
++
++end subroutine path_meta
++
++!=========================================================================================
++
++subroutine cache_active()
++
++   use cam_history, only: hist_fld_active
++
++   integer :: j, p, r
++
++   allocate(act_path(npath), act_reg(npath, nreg), act_bin(npath, nthr), act_sfcb(nsfc, nthr))
++   do j = 1, nthr
++      act_top(1,j) = hist_fld_active('CTT_T'//trim(thr_sfx(j)))
++      act_top(2,j) = hist_fld_active('CTP_T'//trim(thr_sfx(j)))
++      act_top(3,j) = hist_fld_active('CVF_T'//trim(thr_sfx(j)))
++      act_top(4,j) = hist_fld_active('ILF_T'//trim(thr_sfx(j)))
++      act_top(5,j) = hist_fld_active('ISLF_T'//trim(thr_sfx(j)))
++      do p = 1, ncfld
++         act_cbin(p,j) = hist_fld_active(trim(cfld_name(p))//'_CTT_T'//trim(thr_sfx(j)))
++      end do
++   end do
++   do p = 1, npath
++      act_path(p) = .not. stock_field(p) .and. hist_fld_active(trim(p2d_name(p)))
++      do r = 1, nreg
++         act_reg(p,r) = hist_fld_active(trim(p2d_name(p))//'_'//reg_sfx(r))
++      end do
++      do j = 1, nthr
++         act_bin(p,j) = hist_fld_active(trim(path_name(p))//'_CTT_T'//trim(thr_sfx(j)))
++      end do
++   end do
++   do p = 1, nsfc
++      act_sfc(p) = hist_fld_active(trim(sfc_name(p)))
++      do j = 1, nthr
++         act_sfcb(p,j) = hist_fld_active(trim(sfc_name(p))//'_CTT_T'//trim(thr_sfx(j)))
++      end do
++   end do
++   do p = 1, ntb
++      act_tb(p) = hist_fld_active(tb_name(p)//'_TB')
++   end do
++   act_cached = .true.
++
++end subroutine cache_active
++
++!=========================================================================================
++
++subroutine cloud_top_diag_run(state, pbuf, rates, ncol, lchnk)
++
++   use physics_types,  only: physics_state
++   use physics_buffer, only: physics_buffer_desc
++   use physics_buffer, only: pbuf_get_field, pbuf_old_tim_idx   ! (CLD, CTD_IBIN)
++   use cam_history,    only: outfld
++   use physconst,      only: gravit
++   use ref_pres,       only: top_lev=>trop_cloud_top_lev
++
++   type(physics_state),       intent(in) :: state
++   type(physics_buffer_desc), pointer    :: pbuf(:)
++   type(ctd_rates_t),         intent(in) :: rates
++   integer,                   intent(in) :: ncol, lchnk
++
++   real(r8), parameter :: fillv = 1.e36_r8
++
++   integer  :: i, k, j, p, r, b
++   integer  :: ktop(pcols, nthr), ktops(pcols, nthr), ibin(pcols, nthr)
++   real(r8) :: dpg, qc, qi, qs, qm, v
++   real(r8) :: twp(pcols), iwp(pcols), tcp(pcols)
++   real(r8) :: preg(pcols, npath, nreg)              ! regime path sums
++   real(r8) :: tb(pcols, ctd_nbin, ntb)
++   real(r8) :: top2d(pcols, 5, nthr)
++   real(r8) :: f2d(pcols), fbin(pcols, ctd_nbin)
++   real(r8) :: fsfc(pcols)                           ! surface flux of family member p
++   logical  :: has_ext
++   ! locals
++   integer  :: nlay(pcols, nthr), kbase(pcols, nthr), n
++   logical  :: incld(nthr)
++   real(r8) :: twp_reg(pcols, nreg), iwp_reg(pcols, nreg)
++   real(r8) :: tbx(pcols, ctd_nbin, ntbx), topx(pcols, ntopx, nthr)
++   real(r8), pointer :: cld(:,:), ibp(:,:)
++
++   if (.not. ctd_on) return
++   if (.not. act_cached) call cache_active()
++   ! ext rates / ZM surface fluxes are treated as zero when the pbuf pointers are not set
++   has_ext = associated(rates%ext)
++   if (.not. top_cached) call cache_active_top()
++   call pbuf_get_field(pbuf, cld_idx, cld, start=(/1,1,pbuf_old_tim_idx()/), kount=(/pcols,pver,1/))
++   nlay(:ncol,:) = 0
++   kbase(:ncol,:) = 0
++   twp_reg(:ncol,:) = 0._r8
++   iwp_reg(:ncol,:) = 0._r8
++   tbx(:ncol,:,:) = 0._r8
++
++   ktop(:ncol,:)  = 0
++   ktops(:ncol,:) = 0
++   twp(:ncol) = 0._r8
++   iwp(:ncol) = 0._r8
++   tcp(:ncol) = 0._r8
++   preg(:ncol,:,:) = 0._r8
++   tb(:ncol,:,:) = 0._r8
++
++   ! One downward sweep per column fills every accumulator.
++   do i = 1, ncol
++      do k = top_lev, pver
++         dpg = state%pdel(i,k)/gravit
++         qc  = state%q(i,k,ixcldliq)
++         qi  = state%q(i,k,ixcldice)
++         qs  = state%q(i,k,ixsnow)
++         qm  = qc + qi
++         if (ctd_mask_incl_snow) qm = qm + qs
++         do j = 1, nthr
++            if (ktop(i,j)  == 0 .and. qm         > ctd_qthr(j)) ktop(i,j)  = k
++            if (ktops(i,j) == 0 .and. qc+qi+qs   > ctd_qthr(j)) ktops(i,j) = k
++         end do
++
++         twp(i) = twp(i) + (qc+qi)*dpg
++         iwp(i) = iwp(i) + qi*dpg
++         tcp(i) = tcp(i) + (qc+qi+qs)*dpg
++
++         r = ctd_regime(state%t(i,k))
++         do p = 1, ctd_nrates
++            preg(i,p,r) = preg(i,p,r) + rates%val(i,k,p)*dpg
++         end do
++         do p = 1, nten
++            preg(i,ctd_nrates+p,r) = preg(i,ctd_nrates+p,r) + rates%ten(i,k,p)*dpg
++         end do
++         do p = 1, nnm
++            preg(i,ctd_nrates+nten+p,r) = preg(i,ctd_nrates+nten+p,r) + state%q(i,k,inm(p))*dpg
++         end do
++         if (has_ext) then
++            do p = 1, ctd_next
++               preg(i,next0+p,r) = preg(i,next0+p,r) + rates%ext(i,k,p)*dpg
++            end do
++         end if
++
++         b = bin_of(state%t(i,k))
++         if (b > 0) then
++            tb(i,b,1) = tb(i,b,1) + (qc+qi)*dpg
++            tb(i,b,2) = tb(i,b,2) + (qc+qi+qs)*dpg
++            tb(i,b,3) = tb(i,b,3) + (qi+qs)*dpg
++            tb(i,b,4) = tb(i,b,4) + qi*dpg
++         end if
++
++         ! DP_TB/CLD_TB, per-regime TWP/IWP, cloudy blocks (NLAY) and first-block base (CBP)
++         if (b > 0) then
++            tbx(i,b,1) = tbx(i,b,1) + dpg
++            tbx(i,b,2) = tbx(i,b,2) + cld(i,k)*dpg
++         end if
++         twp_reg(i,r) = twp_reg(i,r) + (qc+qi)*dpg
++         iwp_reg(i,r) = iwp_reg(i,r) + qi*dpg
++         if (k == top_lev) incld(:) = .false.
++         do j = 1, nthr
++            if (qm > ctd_qthr(j)) then
++               if (.not. incld(j)) nlay(i,j) = nlay(i,j) + 1
++               if (nlay(i,j) == 1) kbase(i,j) = k
++               incld(j) = .true.
++            else
++               incld(j) = .false.
++            end if
++         end do
++      end do
++
++      ! Cloud-top quantities per threshold
++      do j = 1, nthr
++         ibin(i,j) = 0
++         top2d(i,:,j) = fillv
++         top2d(i,3,j) = 0._r8
++         k = ktop(i,j)
++         if (k > 0) then
++            top2d(i,1,j) = state%t(i,k)
++            top2d(i,2,j) = state%pmid(i,k)
++            top2d(i,3,j) = 1._r8
++            qc = state%q(i,k,ixcldliq)
++            qi = state%q(i,k,ixcldice)
++            if (qc + qi > 0._r8) then
++               top2d(i,4,j) = qi/(qc + qi)
++            else
++               top2d(i,4,j) = 0._r8                 ! snow-only top (ctd_mask_incl_snow)
++            end if
++            ibin(i,j) = bin_of(state%t(i,k))
++         end if
++         k = ktops(i,j)
++         if (k > 0) then
++            qc = state%q(i,k,ixcldliq)
++            qi = state%q(i,k,ixcldice)
++            qs = state%q(i,k,ixsnow)
++            top2d(i,5,j) = (qi + qs)/(qc + qi + qs)
++         end if
++      end do
++   end do
++
++   !== section: top/bins output ===================================
++   ! Output, only for fields requested in some fincl
++   do j = 1, nthr
++      if (act_top(1,j)) call outfld('CTT_T'//trim(thr_sfx(j)),  top2d(:,1,j), pcols, lchnk)
++      if (act_top(2,j)) call outfld('CTP_T'//trim(thr_sfx(j)),  top2d(:,2,j), pcols, lchnk)
++      if (act_top(3,j)) call outfld('CVF_T'//trim(thr_sfx(j)),  top2d(:,3,j), pcols, lchnk)
++      if (act_top(4,j)) call outfld('ILF_T'//trim(thr_sfx(j)),  top2d(:,4,j), pcols, lchnk)
++      if (act_top(5,j)) call outfld('ISLF_T'//trim(thr_sfx(j)), top2d(:,5,j), pcols, lchnk)
++
++      do p = 1, ncfld
++         if (.not. act_cbin(p,j)) cycle
++         fbin(:ncol,:) = 0._r8
++         do i = 1, ncol
++            b = ibin(i,j)
++            if (b == 0) cycle
++            select case (p)
++            case (1); v = 1._r8
++            case (2); v = 1._r8 - top2d(i,4,j)
++            case (3); v = top2d(i,4,j)
++            case (4); v = twp(i)
++            case (5); v = iwp(i)
++            case (6); v = tcp(i)
++            case (7); v = top2d(i,4,j)
++            case default
++               v = 0._r8
++               if (ktops(i,j) > 0) v = top2d(i,5,j)
++            end select
++            fbin(i,b) = v
++         end do
++         call outfld(trim(cfld_name(p))//'_CTT_T'//trim(thr_sfx(j)), fbin, pcols, lchnk)
++      end do
++   end do
++
++   !== section: paths output (WP1 cl-ext) ======================================
++   do p = 1, npath
++      if (act_path(p)) then
++         f2d(:ncol) = preg(:ncol,p,1) + preg(:ncol,p,2) + preg(:ncol,p,3)
++         call outfld(trim(p2d_name(p)), f2d, pcols, lchnk)
++      end if
++      do r = 1, nreg
++         if (act_reg(p,r)) call outfld(trim(p2d_name(p))//'_'//reg_sfx(r), preg(:,p,r), pcols, lchnk)
++      end do
++      do j = 1, nthr
++         if (.not. act_bin(p,j)) cycle
++         fbin(:ncol,:) = 0._r8
++         do i = 1, ncol
++            if (ibin(i,j) > 0) fbin(i,ibin(i,j)) = preg(i,p,1) + preg(i,p,2) + preg(i,p,3)
++         end do
++         call outfld(trim(path_name(p))//'_CTT_T'//trim(thr_sfx(j)), fbin, pcols, lchnk)
++      end do
++   end do
++
++   do p = 1, nsfc
++      if (p <= nsfc0) then
++         fsfc(:ncol) = rates%sfc_flux(:ncol,p)
++      else if (associated(rates%ext_sfc)) then
++         fsfc(:ncol) = rates%ext_sfc(:ncol,p-nsfc0)
++      else
++         fsfc(:ncol) = 0._r8
++      end if
++      if (act_sfc(p)) call outfld(trim(sfc_name(p)), fsfc, pcols, lchnk)
++      do j = 1, nthr
++         if (.not. act_sfcb(p,j)) cycle
++         fbin(:ncol,:) = 0._r8
++         do i = 1, ncol
++            if (ibin(i,j) > 0) fbin(i,ibin(i,j)) = fsfc(i)
++         end do
++         call outfld(trim(sfc_name(p))//'_CTT_T'//trim(thr_sfx(j)), fbin, pcols, lchnk)
++      end do
++   end do
++
++   !== section: top/bins output ===================================
++   do p = 1, ntb
++      if (act_tb(p)) call outfld(tb_name(p)//'_TB', tb(:,:,p), pcols, lchnk)
++   end do
++
++   ! outputs
++   do p = 1, ntbx
++      if (act_tbx(p)) call outfld(trim(tbx_name(p))//'_TB', tbx(:,:,p), pcols, lchnk)
++   end do
++
++   ! cloud-top bin of this call for the binned 2-D fields written later in the step
++   call pbuf_get_field(pbuf, ibin_idx, ibp)
++   ibp(:ncol,:) = real(ibin(:ncol,:), r8)
++
++   do j = 1, nthr
++      do i = 1, ncol
++         topx(i,:,j) = fillv
++         topx(i,7,j) = real(nlay(i,j), r8)
++         topx(i,8,j) = 0._r8
++         k = ktop(i,j)
++         if (k > 0) then
++            qc = state%q(i,k,ixcldliq)
++            qi = state%q(i,k,ixcldice)
++            topx(i,1,j) = state%zm(i,k)
++            topx(i,2,j) = qc
++            topx(i,3,j) = qi
++            topx(i,4,j) = state%q(i,k,inm(1))
++            topx(i,5,j) = state%q(i,k,inm(2))
++            if (kbase(i,j) > 0) topx(i,6,j) = state%pint(i,kbase(i,j)+1)
++            if (qc > 0.1_r8*ctd_qthr(j) .and. qi > 0.1_r8*ctd_qthr(j)) topx(i,8,j) = 1._r8
++         end if
++         if (ktops(i,j) > 0) topx(i,9,j) = state%t(i,ktops(i,j))
++      end do
++      do n = 1, ntopx
++         if (act_topx(n,j)) call outfld(trim(topx_name(n))//'_T'//trim(thr_sfx(j)), topx(:,n,j), pcols, lchnk)
++      end do
++      if (act_mpcb(j)) then
++         fbin(:ncol,:) = 0._r8
++         do i = 1, ncol
++            if (ibin(i,j) > 0) fbin(i,ibin(i,j)) = topx(i,8,j)
++         end do
++         call outfld('MPC_CTT_T'//trim(thr_sfx(j)), fbin, pcols, lchnk)
++      end if
++   end do
++
++   if (jcombo > 0) then
++      j = jcombo
++      do n = 1, ncombo
++         do r = 1, nreg
++            if (.not. act_combo(n,r)) cycle
++            fbin(:ncol,:) = 0._r8
++            do i = 1, ncol
++               if (ibin(i,j) == 0) cycle
++               select case (combo_ix(n))
++               case (-1); v = twp_reg(i,r)
++               case (-2); v = iwp_reg(i,r)
++               case default; v = preg(i,combo_ix(n),r)
++               end select
++               fbin(i,ibin(i,j)) = v
++            end do
++            call outfld(trim(combo_name(n))//'_'//reg_sfx(r)//'_CTT_T'//trim(thr_sfx(j)), fbin, pcols, lchnk)
++         end do
++      end do
++   end if
++
++end subroutine cloud_top_diag_run
++
++!=========================================================================================
++
++subroutine ctd_addfld_default(name, level)
++
++   ! Register a ctd field for add_default on h0 when level <= ctd_h0_default (call after its addfld).
++   ! Levels: 1 = 2-D, 2 = binned at T<ctd_combo_thr> and *_TB, 3 = other thresholds and the combined family.
++   character(len=*), intent(in) :: name
++   integer,          intent(in) :: level
++
++   character(len=reg_len), allocatable :: tn(:)
++   integer, allocatable :: tl(:)
++
++   if (.not. allocated(def_name)) allocate(def_name(256), def_level(256))
++   if (ndef == size(def_name)) then
++      allocate(tn(2*ndef), tl(2*ndef))
++      tn(1:ndef) = def_name(1:ndef)
++      tl(1:ndef) = def_level(1:ndef)
++      call move_alloc(tn, def_name)
++      call move_alloc(tl, def_level)
++   end if
++   ndef = ndef + 1
++   def_name(ndef)  = name
++   def_level(ndef) = level
++
++end subroutine ctd_addfld_default
++
++!=========================================================================================
++
++integer function ctd_default_level(name)
++
++   ! h0 level of a ctd field: registry entry if any, otherwise inferred from the name.
++   character(len=*), intent(in) :: name
++
++   character(len=8) :: csfx
++   integer :: i, k
++
++   do i = 1, ndef
++      if (trim(def_name(i)) == trim(name)) then
++         ctd_default_level = def_level(i)
++         return
++      end if
++   end do
++   write(csfx, '(a,i0)') '_CTT_T', ctd_combo_thr
++   k = index(name, '_CTT_T')
++   ctd_default_level = 1
++   if (len_trim(name) >= 3) then
++      if (name(len_trim(name)-2:len_trim(name)) == '_TB') ctd_default_level = 2
++   end if
++   if (k > 0) then
++      ! Combined '<VAR>_<C|M|W>_CTT_T<j>' is level 3 at any threshold.
++      if (k >= 3) then
++         if (name(k-2:k-2) == '_' .and. scan(name(k-1:k-1), 'CMW') == 1) then
++            ctd_default_level = 3
++            return
++         end if
++      end if
++      if (name(k:min(len_trim(name), k+len_trim(csfx)-1)) == trim(csfx) .and. &
++           len_trim(name) == k + len_trim(csfx) - 1) then
++         ctd_default_level = 2
++      else
++         ctd_default_level = 3
++      end if
++   end if
++
++end function ctd_default_level
++
++!=========================================================================================
++
++subroutine ctd_default_all()
++
++   ! add_default on h0 every master-list field whose long_name starts with 'CTD:' (plus the registry),
++   ! up to level ctd_h0_default; 'I' for the end-of-step stocks '*_END', 'A' otherwise.
++   use cam_history,         only: add_default, hist_fld_list_ctd
++   use cam_history_support, only: max_fieldname_len
++
++   character(len=max_fieldname_len), allocatable :: names(:)
++   integer :: i, n, nl
++   character(len=1) :: flag
++
++   if (.not. ctd_on .or. ctd_h0_default <= 0) return
++   call hist_fld_list_ctd('CTD:', names, n)
++   do i = 1, n + ndef
++      if (i <= n) then
++         if (ctd_default_level(names(i)) > ctd_h0_default) cycle
++         nl = len_trim(names(i))
++         flag = 'A'
++         if (nl >= 4) then
++            if (names(i)(nl-3:nl) == '_END') flag = 'I'
++         end if
++         call add_default(trim(names(i)), 1, flag)
++      else
++         if (def_level(i-n) > ctd_h0_default) cycle
++         nl = len_trim(def_name(i-n))
++         flag = 'A'
++         if (nl >= 4) then
++            if (def_name(i-n)(nl-3:nl) == '_END') flag = 'I'
++         end if
++         call add_default(trim(def_name(i-n)), 1, flag)
++      end if
++   end do
++   if (masterproc) write(iulog,*) 'ctd_default_all: ', n, ' CTD: fields + ', ndef, &
++        ' registered, h0 level ', ctd_h0_default
++   deallocate(names)
++
++end subroutine ctd_default_all
++
++!=========================================================================================
++
++integer function bin_of(t)
++
++   ! ctt_bin index of temperature t (bins are [lower, upper)), 0 if outside the axis.
++   real(r8), intent(in) :: t
++
++   bin_of = floor((t - ctd_ctt_bin0)/ctd_dbin) + 1
++   if (bin_of < 1 .or. bin_of > ctd_nbin) bin_of = 0
++
++end function bin_of
++
++!=========================================================================================
++
++integer function ctd_regime(t)
++
++   ! Layer regime of temperature t: 1 = C (T < 234.15 K), 2 = M, 3 = W (T >= 273.15 K).
++   real(r8), intent(in) :: t
++
++   if (t < t_cold) then
++      ctd_regime = 1
++   else if (t < t_melt) then
++      ctd_regime = 2
++   else
++      ctd_regime = 3
++   end if
++
++end function ctd_regime
++
++!=========================================================================================
++
++subroutine ctd_find_top(state, ncol, ktop)
++
++   ! Cloud-top level per threshold (grid-mean qc+qi[+qs] > ctd_qthr(j), top_lev downward), 0 if none.
++   ! Same rule as the sweep in cloud_top_diag_run, so every module classifies columns identically.
++   use physics_types, only: physics_state
++   use ref_pres,      only: top_lev=>trop_cloud_top_lev
++
++   type(physics_state), intent(in)  :: state
++   integer,             intent(in)  :: ncol
++   integer,             intent(out) :: ktop(pcols, nthr)
++
++   integer  :: i, k, j
++   real(r8) :: qm
++
++   ktop = 0
++   do i = 1, ncol
++      do k = top_lev, pver
++         qm = state%q(i,k,ixcldliq) + state%q(i,k,ixcldice)
++         if (ctd_mask_incl_snow) qm = qm + state%q(i,k,ixsnow)
++         do j = 1, nthr
++            if (ktop(i,j) == 0 .and. qm > ctd_qthr(j)) ktop(i,j) = k
++         end do
++         if (all(ktop(i,:) > 0)) exit
++      end do
++   end do
++
++end subroutine ctd_find_top
++
++!=========================================================================================
++!=======================================================================
++! 2-D field name: '<VAR>_PATH' for rates and tendencies, the plain '<VAR>' for the
++! grid-mean number/mass family (CDNUMC RDMASS), as in the agents brief
++! The ext rates (p > next0) get '<VAR>_PATH' like the MG2 rates.
++function p2d_name(p) result(n)
++   integer, intent(in) :: p
++   character(len=16) :: n
++   if (p > ctd_nrates + nten .and. p <= next0) then
++      n = trim(path_name(p))
++   else
++      n = trim(path_name(p))//'_PATH'
++   end if
++end function p2d_name
++
++logical function stock_field(p)
++   ! True for a plain path name that stock CAM already outputs (same grid-mean quantity): skip addfld/outfld here.
++   integer, intent(in) :: p
++   stock_field = trim(p2d_name(p)) == 'CDNUMC'
++end function stock_field
++
++end module cloud_top_diag

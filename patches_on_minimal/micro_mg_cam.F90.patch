@@ -1,0 +1,72 @@
+diff --git a/src/physics/cam/micro_mg_cam.F90 b/src/physics/cam/micro_mg_cam.F90
+index 962ef77..90cca46 100644
+--- a/src/physics/cam/micro_mg_cam.F90
++++ b/src/physics/cam/micro_mg_cam.F90
+@@ -879,6 +879,14 @@ subroutine micro_mg_cam_init(pbuf2d)
+    call addfld ('ACTREI',      horiz_only,   'A', 'Micron',   'Average Cloud Top ice effective radius'                            )
+    call addfld ('ACTNL',       horiz_only,   'A', 'm-3',   'Average Cloud Top droplet number'                                  )
+    call addfld ('ACTNI',       horiz_only,   'A', 'm-3',   'Average Cloud Top ice number'                                      )
++   call addfld ('ACTT',        horiz_only,   'I', 'K',    'Stratiform Cloud Top Temperature', &
++                flag_xyfill=.true., fill_value=1.e36_r8)
++   call addfld ('ACTP',        horiz_only,   'I', 'Pa',   'Stratiform Cloud Top Pressure', &
++                flag_xyfill=.true., fill_value=1.e36_r8)
++   call addfld ('ACT_NITF',   horiz_only,   'I', 'fraction', 'Cloud Top Ice Number Fraction', &
++                flag_xyfill=.true., fill_value=1.e36_r8)
++   call addfld ('ACT_ITMF',   horiz_only,   'I', 'fraction', 'Cloud Top Ice Mass Fraction', &
++                flag_xyfill=.true., fill_value=1.e36_r8)
+ 
+    call addfld ('FCTL',        horiz_only,   'A', 'fraction', 'Fractional occurrence of cloud top liquid'                         )
+    call addfld ('FCTI',        horiz_only,   'A', 'fraction', 'Fractional occurrence of cloud top ice'                            )
+@@ -1570,6 +1578,10 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+    real(r8) :: ctnl_grid(pcols)
+    real(r8) :: ctni_grid(pcols)
+    real(r8) :: fcti_grid(pcols)
++   real(r8) :: ctt_grid(pcols)     ! cloud top temperature
++   real(r8) :: ctp_grid(pcols)     ! cloud top pressure
++   real(r8) :: acnitf_grid(pcols)  ! cloud top ice number fraction
++   real(r8) :: acitf_grid(pcols)   ! cloud top ice mass fraction (ACT_ITMF)
+    real(r8) :: fctl_grid(pcols)
+ 
+    real(r8) :: ftem_grid(pcols,pver)
+@@ -2997,6 +3009,11 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+    fctm_grid  = 0._r8
+    fctsl_grid = 0._r8
+    fctslm_grid= 0._r8
++   ! Fill value 1.e36 where no cloud top is found
++   ctt_grid    = 1.e36_r8
++   ctp_grid    = 1.e36_r8
++   acnitf_grid = 1.e36_r8
++   acitf_grid  = 1.e36_r8
+ 
+    do i = 1, ngrdcol
+       do k = top_lev, pver
+@@ -3010,6 +3027,18 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+             ctrei_grid(i) = rei_grid(i,k) * icecldf_grid(i,k)
+             ctni_grid(i)  = icinc_grid(i,k) * icecldf_grid(i,k)
+             fcti_grid(i)  = icecldf_grid(i,k)
++            ctt_grid(i)   = state_loc%t(i,k)     ! cloud top temperature
++            ctp_grid(i)   = state_loc%pmid(i,k)  ! cloud top pressure
++            ! ACT_NITF = ACTNI / (ACTNL + ACTNI)
++            if (ctni_grid(i) + ctnl_grid(i) > 0._r8) then
++               acnitf_grid(i) = ctni_grid(i) / (ctni_grid(i) + ctnl_grid(i))
++            end if
++            ! ACT_ITMF = in-cloud ice mass / (ice + liquid) at cloud top
++            ! icecldf == liqcldf == ast always in MG, so cloud fractions cancel;
++            ! must use mixing ratios to get a meaningful ice mass fraction.
++            if (icimrst_grid(i,k) + icwmrst_grid(i,k) > 0._r8) then
++               acitf_grid(i) = icimrst_grid(i,k) / (icimrst_grid(i,k) + icwmrst_grid(i,k))
++            end if
+ 
+             ! Cloud Top Mixed phase, supercooled liquid only and supercooled liquid mixed
+             if (freqi_grid(i,k) > 0.01_r8) then
+@@ -3164,6 +3193,10 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+    call outfld('ACTREI',      ctrei_grid,       pcols, lchnk)
+    call outfld('ACTNL',       ctnl_grid,        pcols, lchnk)
+    call outfld('ACTNI',       ctni_grid,        pcols, lchnk)
++   call outfld('ACTT',        ctt_grid,         pcols, lchnk)
++   call outfld('ACTP',        ctp_grid,         pcols, lchnk)
++   call outfld('ACT_NITF',   acnitf_grid,      pcols, lchnk)
++   call outfld('ACT_ITMF',   acitf_grid,        pcols, lchnk)
+    call outfld('FCTL',        fctl_grid,        pcols, lchnk)
+    call outfld('FCTI',        fcti_grid,        pcols, lchnk)
+    call outfld('ICINC',       icinc_grid,       pcols, lchnk)

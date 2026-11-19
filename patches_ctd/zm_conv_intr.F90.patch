@@ -1,0 +1,49 @@
+diff --git a/src/physics/cam/zm_conv_intr.F90 b/src/physics/cam/zm_conv_intr.F90
+index d5e87a4..9a4fec1 100644
+--- a/src/physics/cam/zm_conv_intr.F90
++++ b/src/physics/cam/zm_conv_intr.F90
+@@ -383,6 +383,9 @@ subroutine zm_conv_tend(pblh    ,mcon    ,cme     , &
+    use check_energy,  only: check_energy_chng
+    use physconst,     only: gravit
+    use phys_control,  only: cam_physpkg_is
++   use cloud_top_diag, only: ctd_on
++   use cloud_top_diag_rates, only: ctd_ext_put, ctd_ext_sfc_put, ctd_ix_zmdq, ctd_ix_evapqzm, &
++        ctd_ix_zmntprpd, ctd_ix_zmntsnpd, ctd_ix_zmdliq, ctd_ix_zmdice
+ 
+    ! Arguments
+ 
+@@ -678,6 +681,8 @@ subroutine zm_conv_tend(pblh    ,mcon    ,cme     , &
+    ftem(:ncol,:pver) = ptend_loc%s(:ncol,:pver)/cpair
+    call outfld('ZMDT    ',ftem           ,pcols   ,lchnk   )
+    call outfld('ZMDQ    ',ptend_loc%q(1,1,1) ,pcols   ,lchnk   )
++   ! ctd ext rates (once per step): zm_convr vapour tendency as in ZMDQ (evaporation is EVAPQZM)
++   if (ctd_on) call ctd_ext_put(pbuf, ctd_ix_zmdq, ncol, ptend_loc%q(:,:,1))
+    call t_stopf ('zm_convr')
+ 
+    call outfld('DIFZM'   ,dif            ,pcols, lchnk)
+@@ -757,6 +762,13 @@ subroutine zm_conv_tend(pblh    ,mcon    ,cme     , &
+    call outfld('ZMFLXSNW', flxsnow, pcols, lchnk)
+    call outfld('ZMNTPRPD', ntprprd, pcols, lchnk)
+    call outfld('ZMNTSNPD', ntsnprd, pcols, lchnk)
++   ! ctd ext rates: ZM precipitation evaporation and production, surface fluxes at pverp
++   if (ctd_on) then
++      call ctd_ext_put(pbuf, ctd_ix_evapqzm,  ncol, ptend_loc%q(:,:,1))
++      call ctd_ext_put(pbuf, ctd_ix_zmntprpd, ncol, ntprprd)
++      call ctd_ext_put(pbuf, ctd_ix_zmntsnpd, ncol, ntsnprd)
++      call ctd_ext_sfc_put(pbuf, ncol, flxprec(:,pverp), flxsnow(:,pverp))
++   end if
+    call outfld('ZMEIHEAT', ptend_loc%s, pcols, lchnk)
+    call outfld('CMFMCDZM   ',mcon ,  pcols   ,lchnk   )
+    call outfld('PRECCDZM   ',prec,  pcols   ,lchnk   )
+@@ -848,6 +860,11 @@ subroutine zm_conv_tend(pblh    ,mcon    ,cme     , &
+ 
+    call outfld('ZMDICE ',ptend_loc%q(1,1,ixcldice) ,pcols   ,lchnk   )
+    call outfld('ZMDLIQ ',ptend_loc%q(1,1,ixcldliq) ,pcols   ,lchnk   )
++   ! ctd ext rates: convtran1 transport of cloud water and ice
++   if (ctd_on) then
++      call ctd_ext_put(pbuf, ctd_ix_zmdliq, ncol, ptend_loc%q(:,:,ixcldliq))
++      call ctd_ext_put(pbuf, ctd_ix_zmdice, ncol, ptend_loc%q(:,:,ixcldice))
++   end if
+ 
+    ! add tendency from this process to tend from other processes here
+    call physics_ptend_sum(ptend_loc,ptend_all, ncol)

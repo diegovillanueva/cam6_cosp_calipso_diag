@@ -1,0 +1,21 @@
+diff --git a/bld/namelist_files/namelist_definition.xml b/bld/namelist_files/namelist_definition.xml
+index 37a5690..004c3f0 100644
+--- a/bld/namelist_files/namelist_definition.xml
++++ b/bld/namelist_files/namelist_definition.xml
+@@ -2401,6 +2401,16 @@ This default is set in cospsimulator_intr.F90
+ Default: 1
+ </entry>
+ 
++<entry id="cosp_15m" type="logical"  category="cosp"
++       group="cospsimulator_nl" valid_values="">
++If true, decouple COSP from the radiation call counter and instead call
++cospsimulator_intr_run every physics timestep from physpkg. Radiation continues
++to run at its normal interval (iradsw); only the optical depths and solar/emissivity
++fields needed by COSP are stored in the physics buffer after each radiation call.
++This default is set in cospsimulator_intr.F90
++Default: FALSE
++</entry>
++
+ <entry id="cosp_lfrac_out" type="logical"  category="cosp"
+        group="cospsimulator_nl" valid_values="">
+ Turns on sub-column output from COSP.

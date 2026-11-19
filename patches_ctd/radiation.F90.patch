@@ -1,0 +1,36 @@
+diff --git a/src/physics/rrtmg/radiation.F90 b/src/physics/rrtmg/radiation.F90
+index 50fba21..188f511 100644
+--- a/src/physics/rrtmg/radiation.F90
++++ b/src/physics/rrtmg/radiation.F90
+@@ -11,6 +11,7 @@ use spmd_utils,          only: masterproc
+ use ppgrid,              only: pcols, pver, pverp, begchunk, endchunk
+ use physics_types,       only: physics_state, physics_ptend
+ use physics_buffer,      only: physics_buffer_desc, pbuf_get_field, pbuf_old_tim_idx
++use cloud_top_diag,      only: ctd_on, cloud_top_diag_bin2d   ! binned LWCF/SWCF/FLNT/FSNT/FLNTC/FSNTC
+ use camsrfexch,          only: cam_out_t, cam_in_t
+ use physconst,           only: cappa, cpair
+ 
+@@ -1331,6 +1332,11 @@ subroutine radiation_output_sw(lchnk, ncol, icall, rd, pbuf, cam_out)
+ 
+    ftem(:ncol) = rd%fsntoa(:ncol) - rd%fsntoac(:ncol)
+    call outfld('SWCF'//diag(icall),     ftem,          pcols, lchnk)
++   if (ctd_on .and. icall == 0) then   ! climate call only, per cloud-top bin
++      call cloud_top_diag_bin2d('FSNT',  fsnt,     ncol, lchnk, pbuf)
++      call cloud_top_diag_bin2d('FSNTC', rd%fsntc, ncol, lchnk, pbuf)
++      call cloud_top_diag_bin2d('SWCF',  ftem,     ncol, lchnk, pbuf)
++   end if
+ 
+    call outfld('FSUTOA'//diag(icall),   rd%fsutoa,     pcols, lchnk)
+ 
+@@ -1419,6 +1425,11 @@ subroutine radiation_output_lw(lchnk, ncol, icall, rd, pbuf, cam_out, freqclr, f
+    
+    ftem(:ncol) = rd%flutc(:ncol) - rd%flut(:ncol)
+    call outfld('LWCF'//diag(icall),    ftem,          pcols, lchnk)
++   if (ctd_on .and. icall == 0) then   ! climate call only, per cloud-top bin
++      call cloud_top_diag_bin2d('FLNT',  flnt,     ncol, lchnk, pbuf)
++      call cloud_top_diag_bin2d('FLNTC', rd%flntc, ncol, lchnk, pbuf)
++      call cloud_top_diag_bin2d('LWCF',  ftem,     ncol, lchnk, pbuf)
++   end if
+ 
+    call outfld('FLN200'//diag(icall),  rd%fln200,     pcols, lchnk)
+    call outfld('FLN200C'//diag(icall), rd%fln200c,    pcols, lchnk)

@@ -1,0 +1,48 @@
+diff --git a/src/control/cam_history.F90 b/src/control/cam_history.F90
+index 56fd7e0..9c23ce8 100644
+--- a/src/control/cam_history.F90
++++ b/src/control/cam_history.F90
+@@ -315,6 +315,7 @@ module cam_history
+   public :: get_hist_restart_filepath ! Return the full filepath to the history restart file
+   public :: hist_fld_active           ! Determine if a field is active on any history file
+   public :: hist_fld_col_active       ! Determine if a field is active on any history file at
++  public :: hist_fld_list_ctd         ! Names of master-list fields whose long_name starts with a prefix
+   ! each column in a chunk
+ 
+ CONTAINS
+@@ -3765,6 +3766,35 @@ end subroutine print_active_fldlst
+ 
+   !#######################################################################
+ 
++  subroutine hist_fld_list_ctd (prefix, names, n)
++    !
++    ! Return the names of all master-list fields whose long_name starts with prefix
++    ! (used by cloud_top_diag to add_default its 'CTD:<GROUP> | ...' fields). Read only.
++    !
++    character(len=*), intent(in) :: prefix
++    character(len=max_fieldname_len), allocatable, intent(out) :: names(:)
++    integer, intent(out) :: n
++
++    type(master_entry), pointer :: listentry
++    integer :: pass
++
++    do pass = 1, 2
++      n = 0
++      listentry => masterlinkedlist
++      do while (associated(listentry))
++        if (index(listentry%field%long_name, prefix) == 1) then
++          n = n + 1
++          if (pass == 2) names(n) = listentry%field%name
++        end if
++        listentry => listentry%next_entry
++      end do
++      if (pass == 1) allocate(names(max(n, 1)))
++    end do
++
++  end subroutine hist_fld_list_ctd
++
++  !#######################################################################
++
+   subroutine h_override (t)
+     !
+     !-----------------------------------------------------------------------

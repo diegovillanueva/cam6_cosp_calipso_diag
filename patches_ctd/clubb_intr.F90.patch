@@ -1,0 +1,65 @@
+diff --git a/src/physics/cam/clubb_intr.F90 b/src/physics/cam/clubb_intr.F90
+index 1dfffd0..4aba481 100644
+--- a/src/physics/cam/clubb_intr.F90
++++ b/src/physics/cam/clubb_intr.F90
+@@ -1026,6 +1026,11 @@ end subroutine clubb_init_cnst
+ !   None
+ !-------------------------------------------------------------------------------
+ 
++   use ctd_water_budget, only: ctd_wb_add_det
++   use cloud_top_diag,   only: ctd_on
++   use cloud_top_diag_rates, only: ctd_ext_put, ctd_ix_rvmtend, ctd_ix_rcmtend, ctd_ix_rimtend, &
++        ctd_ix_qvtendice, ctd_ix_qctendice, ctd_ix_nctendice, ctd_ix_dpdlfliq, ctd_ix_dpdlfice, &
++        ctd_ix_dpdlfnl, ctd_ix_dpdlfni
+    use physics_types,  only: physics_state, physics_ptend, &
+                              physics_state_copy, physics_ptend_init, &
+                              physics_ptend_sum, physics_update, set_dry_to_wet
+@@ -2241,6 +2246,17 @@ end subroutine clubb_init_cnst
+    call outfld( 'RVMTEND_CLUBB', ptend_loc%q(:,:,ixq), pcols, lchnk)
+    call outfld( 'RCMTEND_CLUBB', ptend_loc%q(:,:,ixcldliq), pcols, lchnk)
+    call outfld( 'RIMTEND_CLUBB', ptend_loc%q(:,:,ixcldice), pcols, lchnk)
++   ! ctd ext rates (this substep): CLUBB tendencies; the iceadj slices are zeroed here and
++   ! overwritten below only when clubb_do_liqsupersat, so every slice is rewritten each substep.
++   if (ctd_on) then
++      call ctd_ext_put(pbuf, ctd_ix_rvmtend, ncol, ptend_loc%q(:,:,ixq))
++      call ctd_ext_put(pbuf, ctd_ix_rcmtend, ncol, ptend_loc%q(:,:,ixcldliq))
++      call ctd_ext_put(pbuf, ctd_ix_rimtend, ncol, ptend_loc%q(:,:,ixcldice))
++      temp2dp(:ncol,:) = 0._r8
++      call ctd_ext_put(pbuf, ctd_ix_qvtendice, ncol, temp2dp)
++      call ctd_ext_put(pbuf, ctd_ix_qctendice, ncol, temp2dp)
++      call ctd_ext_put(pbuf, ctd_ix_nctendice, ncol, temp2dp)
++   end if
+    call outfld( 'STEND_CLUBB',   ptend_loc%s,pcols, lchnk)
+    call outfld( 'UTEND_CLUBB',   ptend_loc%u,pcols, lchnk)
+    call outfld( 'VTEND_CLUBB',   ptend_loc%v,pcols, lchnk)     
+@@ -2300,6 +2316,12 @@ end subroutine clubb_init_cnst
+       call outfld( 'QVTENDICE', qvtend, pcols, lchnk )
+       call outfld( 'QCTENDICE', qctend, pcols, lchnk )
+       call outfld( 'NCTENDICE', inctend, pcols, lchnk )
++      ! ctd ext rates: tendencies of the RHliq <= 1 saturation adjustment (zero above top_lev)
++      if (ctd_on) then
++         call ctd_ext_put(pbuf, ctd_ix_qvtendice, ncol, qvtend)
++         call ctd_ext_put(pbuf, ctd_ix_qctendice, ncol, qctend)
++         call ctd_ext_put(pbuf, ctd_ix_nctendice, ncol, inctend)
++      end if
+  
+       where(qctend .ne. 0._r8)
+         fqtend = 1._r8
+@@ -2393,7 +2415,17 @@ end subroutine clubb_init_cnst
+    det_ice(:ncol) = det_ice(:ncol)/1000._r8  ! divide by density of water
+ 
+    call outfld( 'DPDLFLIQ', ptend_loc%q(:,:,ixcldliq), pcols, lchnk)
++   ! ctd water budget: book the detrainment as DET instead of CLUBB
++   call ctd_wb_add_det(lchnk, ncol, ptend_loc%q(:,:,ixcldliq), ptend_loc%q(:,:,ixcldice), &
++        state1%pdel, hdtime)
+    call outfld( 'DPDLFICE', ptend_loc%q(:,:,ixcldice), pcols, lchnk)
++   ! ctd ext rates: detrained convective condensate mass and number (before physics_update)
++   if (ctd_on) then
++      call ctd_ext_put(pbuf, ctd_ix_dpdlfliq, ncol, ptend_loc%q(:,:,ixcldliq))
++      call ctd_ext_put(pbuf, ctd_ix_dpdlfice, ncol, ptend_loc%q(:,:,ixcldice))
++      call ctd_ext_put(pbuf, ctd_ix_dpdlfnl,  ncol, ptend_loc%q(:,:,ixnumliq))
++      call ctd_ext_put(pbuf, ctd_ix_dpdlfni,  ncol, ptend_loc%q(:,:,ixnumice))
++   end if
+    
+    temp2dp(:ncol,:pver) =  ptend_loc%s(:ncol,:pver)/cpair
+    call outfld( 'DPDLFT',   temp2dp, pcols, lchnk)

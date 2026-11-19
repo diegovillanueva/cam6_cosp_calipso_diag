@@ -1,0 +1,180 @@
+diff --git a/src/physics/cam/micro_mg_cam.F90 b/src/physics/cam/micro_mg_cam.F90
+index 90cca46..965da0a 100644
+--- a/src/physics/cam/micro_mg_cam.F90
++++ b/src/physics/cam/micro_mg_cam.F90
+@@ -405,7 +405,15 @@ subroutine micro_mg_cam_register
+    ! Register microphysics constituents and fields in the physics buffer.
+    !-----------------------------------------------------------------------
+ 
++   use cloud_top_diag,   only: ctd_on, cloud_top_diag_register
++   use ctd_water_budget, only: ctd_wb_register
++   use cloud_top_diag_rates, only: ctd_pbuf_ext, ctd_pbuf_ext_sfc, ctd_next, ctd_nsfx
++   use cloud_top_diag,       only: ctd_nthr_top=>nthr          ! CTD_IBIN shape
++   use cloud_top_diag_rates, only: ctd_pbuf_ibin                ! CTD_IBIN name
++
+    logical :: prog_modal_aero
++   integer :: idx_ctd            ! pbuf index of the ctd ext fields (looked up again in ctd_ext_init)
++   integer :: ctd_ibin_idx
+    logical :: use_subcol_microp  ! If true, then are using subcolumns in microphysics
+ 
+    call phys_getopts(use_subcol_microp_out    = use_subcol_microp, &
+@@ -590,6 +598,17 @@ subroutine micro_mg_cam_register
+       call pbuf_add_field('NSNOW',   'global',dtype_r8,(/pcols,pver/), nsnow_idx)
+    end if
+ 
++   ! ctd water budget: restart-persistent end-of-step column (needs ctd_on, read in readnl)
++   if (ctd_on) then
++      call cloud_top_diag_register()
++      call ctd_wb_register()
++      ! ctd ext rates: layer rates written by clubb_intr / zm_conv_intr, read before cloud_top_diag_run
++      call pbuf_add_field(ctd_pbuf_ext,     'physpkg', dtype_r8, (/pcols,pver,ctd_next/), idx_ctd)
++      call pbuf_add_field(ctd_pbuf_ext_sfc, 'physpkg', dtype_r8, (/pcols,ctd_nsfx/),      idx_ctd)
++      ! cloud-top bin per threshold of the last cloud_top_diag_run call, read by cloud_top_diag_bin2d
++      call pbuf_add_field(ctd_pbuf_ibin, 'physpkg', dtype_r8, (/pcols, ctd_nthr_top/), ctd_ibin_idx)
++   end if
++
+ end subroutine micro_mg_cam_register
+ 
+ !===============================================================================
+@@ -640,6 +659,9 @@ subroutine micro_mg_cam_init(pbuf2d)
+    use micro_mg_utils, only: micro_mg_utils_init
+    use micro_mg1_0, only: micro_mg_init1_0 => micro_mg_init
+    use micro_mg2_0, only: micro_mg_init2_0 => micro_mg_init
++   use cloud_top_diag, only: ctd_on, cloud_top_diag_init, ctd_default_all
++   use ctd_water_budget, only: ctd_wb_init
++   use cloud_top_diag_rates, only: ctd_ext_init
+ 
+    !-----------------------------------------------------------------------
+    !
+@@ -1123,6 +1145,16 @@ subroutine micro_mg_cam_init(pbuf2d)
+ 
+    end if
+ 
++   ! Cloud-top diagnostics; the rates are taken from grid-box (not subcolumn) MG output.
++   if (ctd_on) then
++      if (use_subcol_microp) call endrun('micro_mg_cam_init: cloud_top_diag (ctd_on) needs use_subcol_microp=.false.')
++      if (micro_mg_version < 2) call endrun('micro_mg_cam_init: cloud_top_diag (ctd_on) needs micro_mg_version >= 2')
++      call cloud_top_diag_init()
++      call ctd_wb_init(pbuf2d)
++      call ctd_default_all()   ! add_default every CTD: field once all modules have registered theirs
++      call ctd_ext_init(pbuf2d)
++   end if
++
+ end subroutine micro_mg_cam_init
+ 
+ !===============================================================================
+@@ -1169,6 +1201,9 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+ 
+    use micro_mg1_0, only: micro_mg_tend1_0 => micro_mg_tend
+    use micro_mg2_0, only: micro_mg_tend2_0 => micro_mg_tend
++   use cloud_top_diag,       only: ctd_on, cloud_top_diag_run
++   use cloud_top_diag,       only: cloud_top_diag_bin2d
++   use cloud_top_diag_rates, only: ctd_rates_t, ctd_rates_fill, ctd_rates_free, ctd_ext_get
+ 
+    use physics_buffer,  only: pbuf_col_type_index
+    use subcol,          only: subcol_field_avg
+@@ -1281,6 +1316,14 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+    real(r8), target :: meltsdt(state%psetcols,pver)
+    real(r8), target :: frzrdt (state%psetcols,pver)
+    real(r8), target :: mnuccdo(state%psetcols,pver)
++   ! Extra grid-mean MG2 rates for cloud_top_diag (see cloud_top_diag_rates.F90)
++   real(r8), target :: ctd_mnuccdg(state%psetcols,pver)
++   real(r8), target :: ctd_mnudep(state%psetcols,pver)
++   real(r8), target :: ctd_mnuccri(state%psetcols,pver)
++   real(r8), target :: ctd_nnuccc(state%psetcols,pver)
++   real(r8), target :: ctd_nnucct(state%psetcols,pver)
++   real(r8), target :: ctd_nnudep(state%psetcols,pver)
++   type(ctd_rates_t) :: ctd_rates
+    real(r8), target :: nrout(state%psetcols,pver)
+    real(r8), target :: nsout(state%psetcols,pver)
+    real(r8), target :: refl(state%psetcols,pver)    ! analytic radar reflectivity
+@@ -1405,6 +1448,12 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+    real(r8), target :: packed_meltsdt(mgncol,nlev)
+    real(r8), target :: packed_frzrdt(mgncol,nlev)
+    real(r8), target :: packed_mnuccd(mgncol,nlev)
++   real(r8), target :: packed_ctd_mnuccdg(mgncol,nlev)
++   real(r8), target :: packed_ctd_mnudep(mgncol,nlev)
++   real(r8), target :: packed_ctd_mnuccri(mgncol,nlev)
++   real(r8), target :: packed_ctd_nnuccc(mgncol,nlev)
++   real(r8), target :: packed_ctd_nnucct(mgncol,nlev)
++   real(r8), target :: packed_ctd_nnudep(mgncol,nlev)
+    real(r8), target :: packed_nrout(mgncol,nlev)
+    real(r8), target :: packed_nsout(mgncol,nlev)
+    real(r8), target :: packed_refl(mgncol,nlev)
+@@ -2037,6 +2086,12 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+    call post_proc%add_field(p(meltsdt), p(packed_meltsdt))
+    call post_proc%add_field(p(frzrdt), p(packed_frzrdt))
+    call post_proc%add_field(p(mnuccdo), p(packed_mnuccd))
++   call post_proc%add_field(p(ctd_mnuccdg), p(packed_ctd_mnuccdg))
++   call post_proc%add_field(p(ctd_mnudep),  p(packed_ctd_mnudep))
++   call post_proc%add_field(p(ctd_mnuccri), p(packed_ctd_mnuccri))
++   call post_proc%add_field(p(ctd_nnuccc),  p(packed_ctd_nnuccc))
++   call post_proc%add_field(p(ctd_nnucct),  p(packed_ctd_nnucct))
++   call post_proc%add_field(p(ctd_nnudep),  p(packed_ctd_nnudep))
+    call post_proc%add_field(p(nrout), p(packed_nrout))
+    call post_proc%add_field(p(nsout), p(packed_nsout))
+ 
+@@ -2137,6 +2192,14 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+          packed_ns = packer%pack(state_loc%q(:,:,ixnumsnow))
+       end if
+ 
++      ! MG1 does not set these.
++      packed_ctd_mnuccdg = 0._r8
++      packed_ctd_mnudep  = 0._r8
++      packed_ctd_mnuccri = 0._r8
++      packed_ctd_nnuccc  = 0._r8
++      packed_ctd_nnucct  = 0._r8
++      packed_ctd_nnudep  = 0._r8
++
+       select case (micro_mg_version)
+       case (1)
+          select case (micro_mg_sub_version)
+@@ -2226,7 +2289,9 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+                  errstring, &
+                  packed_tnd_qsnow,packed_tnd_nsnow,packed_re_ice,&
+                  packed_prer_evap,                                     &
+-                 packed_frzimm,  packed_frzcnt,  packed_frzdep   )
++                 packed_frzimm,  packed_frzcnt,  packed_frzdep,  &
++                 packed_ctd_mnuccdg, packed_ctd_mnudep, packed_ctd_mnuccri, &
++                 packed_ctd_nnuccc,  packed_ctd_nnucct, packed_ctd_nnudep   )
+          end select
+       end select
+ 
+@@ -2281,6 +2346,26 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+ 
+    call post_proc%finalize()
+ 
++   ! Cloud-top diagnostics on the post-microphysics state (grid-box columns only).
++   if (ctd_on) then
++      call ctd_rates_fill(ctd_rates, ncol, &
++           prco, prao, mnuccco, mnuccto, homoo, msacwio, psacwso, bergo, bergso, &
++           prcio, praio, ctd_mnuccdg, ctd_mnudep, cmeiout, qireso, qcreso, qvres, cmeice, &
++           pracso, mnuccro, ctd_mnuccri, frzrdt, meltsdt, melto, nevapr, evapsnow, &
++           qcsevap, qisevap, prer_evap, qcsedten, qisedten, qrsedten, qssedten, &
++           ctd_nnuccc, ctd_nnucct, ctd_nnudep, &
++           rflx, sflx, cflx, iflx, &
++           qcten, qiten, qrten, qsten, ncten, niten, nrten, nsten, &
++           state_loc%q(:,:,ixcldliq), state_loc%q(:,:,ixcldice), &
++           state_loc%q(:,:,ixsnow),   state_loc%q(:,:,ixrain),   &
++           state_loc%q(:,:,ixnumliq), state_loc%q(:,:,ixnumice), &
++           state_loc%q(:,:,ixnumsnow), state_loc%q(:,:,ixnumrain))
++      ! Point the ext table at CTD_EXT (CLUBB slices: this substep, ZM slices: this step)
++      call ctd_ext_get(pbuf, ctd_rates)
++      call cloud_top_diag_run(state_loc, pbuf, ctd_rates, ncol, lchnk)
++      call ctd_rates_free(ctd_rates)
++   end if
++
+    ! Check to make sure that the microphysics code is respecting the flags that control
+    ! whether MG should be prognosing cloud ice and cloud liquid or not.
+    if (.not. do_cldice) then
+@@ -3193,6 +3278,10 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+    call outfld('ACTREI',      ctrei_grid,       pcols, lchnk)
+    call outfld('ACTNL',       ctnl_grid,        pcols, lchnk)
+    call outfld('ACTNI',       ctni_grid,        pcols, lchnk)
++   if (ctd_on) then   ! ACTNL/ACTNI per cloud-top bin
++      call cloud_top_diag_bin2d('ACTNL', ctnl_grid, ncol, lchnk, pbuf)
++      call cloud_top_diag_bin2d('ACTNI', ctni_grid, ncol, lchnk, pbuf)
++   end if
+    call outfld('ACTT',        ctt_grid,         pcols, lchnk)
+    call outfld('ACTP',        ctp_grid,         pcols, lchnk)
+    call outfld('ACT_NITF',   acnitf_grid,      pcols, lchnk)

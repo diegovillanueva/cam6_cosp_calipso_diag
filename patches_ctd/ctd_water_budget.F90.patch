@@ -1,0 +1,432 @@
+diff --git a/src/physics/cam/ctd_water_budget.F90 b/src/physics/cam/ctd_water_budget.F90
+new file mode 100644
+index 0000000..1abe92e
+--- /dev/null
++++ b/src/physics/cam/ctd_water_budget.F90
+@@ -0,0 +1,426 @@
++module ctd_water_budget
++!---------------------------------------------------------------------------------
++! Closed column budget of cloud liquid (CLDLIQ), ice (CLDICE), vapour (Q), rain (RAINQM)
++! and snow (SNOWQM) per process, active with ctd_on (cloud_top_diag). Instead of hooking
++! physics_update (drivers such as clubb_tend_cam, zm_conv_tend and convect_shallow_tend call
++! it internally on local state copies, which would double count), physpkg places "marks":
++! each mark takes the layer masses q*pdel/g of the real physics state and books the change
++! since the previous mark into one category. Every change of the state therefore lands in
++! exactly one category, including qneg3 clipping and direct state edits.
++!
++! Fields (all grid-mean, column-integrated, time-mean over the physics step):
++!   D<P>_<CAT>_PATH [kg/m2/s], P = LIQ, ICE, VAP, RAIN, SNOW,
++!   CAT = DYN   : change between the end of tphysac and the next tphysbc start
++!                 (dynamics/advection + dp coupling; 0 only in the first step of an initial run)
++!         ZM    : deep convection (convect_deep_tend and convect_deep_tend_2), incl. PRECC removal
++!         SHCU  : convect_shallow_tend (0 with CLUBB_SGS shallow)
++!         CLUBB : clubb_tend_cam without the convective detrainment below; holds the surface
++!                 moisture flux QFLX (CLUBB applies cam_in%cflx(:,1) as its lower boundary)
++!         DET   : detrainment of ZM/shallow condensate applied inside clubb_tend_cam
++!         MG2   : microp_aero + MG2 (incl. sedimentation, i.e. the PRECL removal),
++!                 macro/micro substeps summed
++!         OTHER : everything else between the marks (energy fixer, dadadj, qneg3,
++!                 wet deposition, tphysac processes, dme_adjust)
++!         TEND  : (W_end - W_end of the previous step)/dt, the storage change
++!   W<P>_END [kg/m2]: column at the end of tphysac (use :I for budget checks).
++!   D<P>_<CLUBB|MG2>_<SRC|SNK>_PATH [kg/m2/s]: gross parts of CLUBB and MG2, the column sums
++!                 of the level-wise increases (SRC >= 0) and decreases (SNK <= 0) per call;
++!                 SRC + SNK = CAT. Levels exchanging mass cancel only within a level.
++!   <name>_<R>, R = C/M/W: the same sums restricted to layers with T < 234.15 K,
++!                 234.15 <= T < 273.15 K and T >= 273.15 K.
++!   D<P>_<CAT>_CTT_T<j>, D<P>_<CLUBB|MG2>_<SRC|SNK>_CTT_T<j> (P = LIQ, ICE only): the column
++!                 value placed in the cloud-top temperature bin of threshold j, 0 elsewhere.
++! One classification per step and column, taken at ctd_wb_begin (post-dynamics state):
++!   layer regime from state%t and cloud-top bin from ctd_find_top, used by every category.
++! The layer-resolved end-of-step masses are kept in the global pbuf field CTD_WB_WEND3
++!   (pcols,pver,5), written to the restart file, so DYN is defined in the first step after a
++!   restart (level 1 < 0 = unset).
++! Closure (exact up to round-off, per column, step and regime 0/C/M/W):
++!   TEND = DYN + ZM + SHCU + CLUBB + DET + MG2 + OTHER
++!---------------------------------------------------------------------------------
++
++use shr_kind_mod, only: r8 => shr_kind_r8
++use ppgrid,       only: pcols, pver, begchunk, endchunk
++use physconst,    only: gravit
++use physics_types, only: physics_state
++use physics_buffer, only: physics_buffer_desc, pbuf_add_field, pbuf_get_field, pbuf_set_field, &
++                          dtype_r8
++use cloud_top_diag, only: bin_of, ctd_regime, ctd_find_top, nthr, nreg, reg_sfx, thr_sfx, &
++                          ctd_nbin
++
++implicit none
++private
++save
++
++public :: ctd_wb_register, ctd_wb_init, ctd_wb_begin, ctd_wb_mark, ctd_wb_add_det, ctd_wb_end
++
++integer, public, parameter :: wb_dyn = 1, wb_zm = 2, wb_shcu = 3, wb_clubb = 4, &
++                              wb_det = 5, wb_mg2 = 6, wb_other = 7, wb_tend = 8
++integer, parameter :: nwb = 8
++character(len=5), parameter :: wb_name(nwb) = [character(len=5) :: &
++     'DYN', 'ZM', 'SHCU', 'CLUBB', 'DET', 'MG2', 'OTHER', 'TEND']
++character(len=64), parameter :: wb_long(nwb) = [character(len=64) :: &
++     'dynamics (tphysac end to tphysbc start)', 'deep convection (ZM)', &
++     'shallow convection', 'CLUBB without convective detrainment', &
++     'convective detrainment (in clubb_tend_cam)', 'microp_aero + MG2', &
++     'other physics, fixers and clipping', 'storage change']
++! Species: 1 LIQ, 2 ICE (binned), 3 VAP, 4 RAIN, 5 SNOW.
++integer, parameter :: ns = 5, nsb = 2
++character(len=4), parameter :: sp_name(ns) = [character(len=4) :: 'LIQ', 'ICE', 'VAP', 'RAIN', 'SNOW']
++character(len=6), parameter :: sp_cnst(ns) = [character(len=6) :: 'CLDLIQ', 'CLDICE', 'Q', 'RAINQM', 'SNOWQM']
++character(len=40), parameter :: reg_long(nreg) = [character(len=40) :: &
++     ', layers T < 234.15 K', ', layers 234.15 K <= T < 273.15 K', ', layers T >= 273.15 K']
++! Categories with a gross split (index into gsrc/gsnk).
++integer, parameter :: ngr = 2
++integer, parameter :: gr_cat(ngr) = [wb_clubb, wb_mg2]
++character(len=3), parameter :: gs_name(2) = ['SRC', 'SNK']
++
++logical, public :: wb_on = .false.
++integer :: ix(ns) = -1, wend_idx = -1
++
++real(r8), allocatable :: acc(:,:,:,:,:)   ! (pcols, ns, nwb, 0:nreg, chunk) kg/m2 accumulated
++real(r8), allocatable :: gsrc(:,:,:,:,:)  ! (pcols, ns, ngr, 0:nreg, chunk) kg/m2 level-wise gains
++real(r8), allocatable :: gsnk(:,:,:,:,:)  ! (pcols, ns, ngr, 0:nreg, chunk) kg/m2 level-wise losses
++real(r8), allocatable :: mlast(:,:,:,:)   ! (pcols, pver, ns, chunk) layer mass at the last mark
++integer,  allocatable :: wb_reg(:,:,:)    ! (pcols, pver, chunk) layer regime at ctd_wb_begin
++integer,  allocatable :: wb_ibin(:,:,:)   ! (pcols, nthr, chunk) cloud-top bin at ctd_wb_begin (0 = none)
++
++! hist_fld_active flags, cached on the first ctd_wb_end call (history is set up by then)
++logical :: act_cached = .false.
++logical :: act_creg(ns,nwb,nreg), act_greg(ns,ngr,2,nreg)
++logical :: act_cbin(nsb,nwb,nthr), act_gbin(nsb,ngr,2,nthr)
++
++contains
++
++!=================================================================================
++
++subroutine ctd_wb_register()
++   ! Global pbuf field: written to and read from the restart file.
++   wb_on = .true.
++   call pbuf_add_field('CTD_WB_WEND3', 'global', dtype_r8, (/pcols,pver,ns/), wend_idx)
++end subroutine ctd_wb_register
++
++!=================================================================================
++
++character(len=24) function nm(s, c, g)
++   ! Base name D<P>_<CAT>[_<SRC|SNK>] (g = 0: net category).
++   integer, intent(in) :: s, c, g
++   if (g == 0) then
++      nm = 'D'//trim(sp_name(s))//'_'//trim(wb_name(c))
++   else
++      nm = 'D'//trim(sp_name(s))//'_'//trim(wb_name(gr_cat(c)))//'_'//gs_name(g)
++   end if
++end function nm
++
++!=================================================================================
++
++subroutine ctd_wb_init(pbuf2d)
++   use cam_history,  only: addfld, horiz_only
++   use constituents, only: cnst_get_ind
++   use time_manager, only: is_first_step
++   type(physics_buffer_desc), pointer :: pbuf2d(:,:)
++   character(len=128) :: lg
++   integer :: c, s, g, r, j
++   if (.not. wb_on) return
++   do s = 1, ns
++      call cnst_get_ind(sp_cnst(s), ix(s))
++   end do
++   allocate(acc(pcols,ns,nwb,0:nreg,begchunk:endchunk), gsrc(pcols,ns,ngr,0:nreg,begchunk:endchunk), &
++            gsnk(pcols,ns,ngr,0:nreg,begchunk:endchunk), mlast(pcols,pver,ns,begchunk:endchunk), &
++            wb_reg(pcols,pver,begchunk:endchunk), wb_ibin(pcols,nthr,begchunk:endchunk))
++   acc = 0._r8
++   gsrc = 0._r8
++   gsnk = 0._r8
++   mlast = 0._r8
++   wb_reg = 1
++   wb_ibin = 0
++   if (is_first_step()) call pbuf_set_field(pbuf2d, wend_idx, -1._r8)
++   do s = 1, ns
++      do c = 1, nwb
++         lg = 'Column '//trim(sp_cnst(s))//' change: '//trim(wb_long(c))
++         call addfld(trim(nm(s,c,0))//'_PATH', horiz_only, 'A', 'kg/m2/s', 'CTD:BUDGET | '//trim(lg))
++         do r = 1, nreg
++            call addfld(trim(nm(s,c,0))//'_PATH_'//reg_sfx(r), horiz_only, 'A', 'kg/m2/s', &
++                 'CTD:BUDGET | '//trim(lg)//trim(reg_long(r)))
++         end do
++         if (s <= nsb) then
++            do j = 1, nthr
++               call addfld(trim(nm(s,c,0))//'_CTT_T'//trim(thr_sfx(j)), (/'ctt_bin'/), 'A', 'kg/m2/s', &
++                    'CTD:BUDGETBIN | '//trim(lg)//', per CTT bin, threshold 1e-'//trim(thr_sfx(j))//' kg/kg')
++            end do
++         end if
++      end do
++      do c = 1, ngr
++         do g = 1, 2
++            if (g == 1) then
++               lg = 'Column sum of level-wise '//trim(sp_cnst(s))//' gains: '//trim(wb_long(gr_cat(c)))
++            else
++               lg = 'Column sum of level-wise '//trim(sp_cnst(s))//' losses: '//trim(wb_long(gr_cat(c)))
++            end if
++            call addfld(trim(nm(s,c,g))//'_PATH', horiz_only, 'A', 'kg/m2/s', 'CTD:BUDGETGROSS | '//trim(lg))
++            do r = 1, nreg
++               call addfld(trim(nm(s,c,g))//'_PATH_'//reg_sfx(r), horiz_only, 'A', 'kg/m2/s', &
++                    'CTD:BUDGETGROSS | '//trim(lg)//trim(reg_long(r)))
++            end do
++            if (s <= nsb) then
++               do j = 1, nthr
++                  call addfld(trim(nm(s,c,g))//'_CTT_T'//trim(thr_sfx(j)), (/'ctt_bin'/), 'A', 'kg/m2/s', &
++                       'CTD:BUDGETBIN | '//trim(lg)//', per CTT bin, threshold 1e-'//trim(thr_sfx(j))//' kg/kg')
++               end do
++            end if
++         end do
++      end do
++      call addfld('W'//trim(sp_name(s))//'_END', horiz_only, 'A', 'kg/m2', &
++           'CTD:BUDGET | Column '//trim(sp_cnst(s))//' at the end of tphysac')
++   end do
++end subroutine ctd_wb_init
++
++!=================================================================================
++
++subroutine layers(state, m)
++   ! Layer mass q*pdel/g per species [kg/m2].
++   type(physics_state), intent(in) :: state
++   real(r8), intent(out) :: m(pcols,pver,ns)
++   integer :: ncol, s
++   ncol = state%ncol
++   m = 0._r8
++   do s = 1, ns
++      m(:ncol,:,s) = state%q(:ncol,:,ix(s))*state%pdel(:ncol,:)/gravit
++   end do
++end subroutine layers
++
++!=================================================================================
++
++subroutine book(lchnk, ncol, icat, dm, wgross)
++   ! Add layer changes dm to category icat, per regime and total (and the gross split).
++   integer,  intent(in) :: lchnk, ncol, icat
++   real(r8), intent(in) :: dm(pcols,pver,ns)
++   logical,  intent(in) :: wgross
++   integer :: i, k, r, g, ig
++   ig = 0
++   if (wgross) then
++      do g = 1, ngr
++         if (gr_cat(g) == icat) ig = g
++      end do
++   end if
++   do k = 1, pver
++      do i = 1, ncol
++         r = wb_reg(i,k,lchnk)
++         acc(i,:,icat,0,lchnk) = acc(i,:,icat,0,lchnk) + dm(i,k,:)
++         acc(i,:,icat,r,lchnk) = acc(i,:,icat,r,lchnk) + dm(i,k,:)
++         if (ig > 0) then
++            gsrc(i,:,ig,0,lchnk) = gsrc(i,:,ig,0,lchnk) + max(dm(i,k,:), 0._r8)
++            gsrc(i,:,ig,r,lchnk) = gsrc(i,:,ig,r,lchnk) + max(dm(i,k,:), 0._r8)
++            gsnk(i,:,ig,0,lchnk) = gsnk(i,:,ig,0,lchnk) + min(dm(i,k,:), 0._r8)
++            gsnk(i,:,ig,r,lchnk) = gsnk(i,:,ig,r,lchnk) + min(dm(i,k,:), 0._r8)
++         end if
++      end do
++   end do
++end subroutine book
++
++!=================================================================================
++
++subroutine ctd_wb_begin(state, pbuf)
++   ! Start of tphysbc: classify layers and cloud tops, book the change since the end of
++   ! the last tphysac as dynamics.
++   type(physics_state), intent(in) :: state
++   type(physics_buffer_desc), pointer :: pbuf(:)
++   real(r8), pointer :: wend(:,:,:)
++   real(r8) :: m(pcols,pver,ns), dm(pcols,pver,ns)
++   integer :: ktop(pcols,nthr)
++   integer :: lchnk, ncol, i, k, j
++   if (.not. wb_on) return
++   lchnk = state%lchnk
++   ncol  = state%ncol
++   wb_reg(:,:,lchnk) = 1
++   do k = 1, pver
++      do i = 1, ncol
++         wb_reg(i,k,lchnk) = ctd_regime(state%t(i,k))
++      end do
++   end do
++   call ctd_find_top(state, ncol, ktop)
++   wb_ibin(:,:,lchnk) = 0
++   do j = 1, nthr
++      do i = 1, ncol
++         if (ktop(i,j) > 0) wb_ibin(i,j,lchnk) = bin_of(state%t(i,ktop(i,j)))
++      end do
++   end do
++   call pbuf_get_field(pbuf, wend_idx, wend)
++   call layers(state, m)
++   dm = 0._r8
++   do i = 1, ncol
++      if (wend(i,1,1) >= 0._r8) dm(i,:,:) = m(i,:,:) - wend(i,:,:)
++   end do
++   call book(lchnk, ncol, wb_dyn, dm, .false.)
++   mlast(:,:,:,lchnk) = m
++end subroutine ctd_wb_begin
++
++!=================================================================================
++
++subroutine ctd_wb_mark(state, icat)
++   ! Book the change since the previous mark into category icat.
++   type(physics_state), intent(in) :: state
++   integer, intent(in) :: icat
++   real(r8) :: m(pcols,pver,ns), dm(pcols,pver,ns)
++   integer :: lchnk
++   if (.not. wb_on) return
++   lchnk = state%lchnk
++   call layers(state, m)
++   dm = m - mlast(:,:,:,lchnk)
++   call book(lchnk, state%ncol, icat, dm, .true.)
++   mlast(:,:,:,lchnk) = m
++end subroutine ctd_wb_mark
++
++!=================================================================================
++
++subroutine ctd_wb_add_det(lchnk, ncol, dliq, dice, pdel, dt_eff)
++   ! Detrainment tendencies [kg/kg/s] applied inside clubb_tend_cam move from CLUBB to
++   ! DET. dt_eff = macmic substep length: physpkg scales the CLUBB ptend by 1/num_steps and
++   ! applies it over ztodt, so each substep tendency acts for ztodt/num_steps.
++   ! The CLUBB gross split (SRC/SNK) still contains the detrainment.
++   integer,  intent(in) :: lchnk, ncol
++   real(r8), intent(in) :: dliq(:,:), dice(:,:), pdel(:,:), dt_eff
++   real(r8) :: w(2)
++   integer :: i, k, r
++   if (.not. wb_on) return
++   do k = 1, pver
++      do i = 1, ncol
++         r = wb_reg(i,k,lchnk)
++         w(1) = dliq(i,k)*pdel(i,k)/gravit*dt_eff
++         w(2) = dice(i,k)*pdel(i,k)/gravit*dt_eff
++         acc(i,1:2,wb_det,0,lchnk)   = acc(i,1:2,wb_det,0,lchnk)   + w
++         acc(i,1:2,wb_det,r,lchnk)   = acc(i,1:2,wb_det,r,lchnk)   + w
++         acc(i,1:2,wb_clubb,0,lchnk) = acc(i,1:2,wb_clubb,0,lchnk) - w
++         acc(i,1:2,wb_clubb,r,lchnk) = acc(i,1:2,wb_clubb,r,lchnk) - w
++      end do
++   end do
++end subroutine ctd_wb_add_det
++
++!=================================================================================
++
++subroutine cache_active()
++   ! Cache hist_fld_active so inactive regime/bin fields cost no outfld call.
++   use cam_history, only: hist_fld_active
++   integer :: s, c, g, r, j
++   do s = 1, ns
++      do r = 1, nreg
++         do c = 1, nwb
++            act_creg(s,c,r) = hist_fld_active(trim(nm(s,c,0))//'_PATH_'//reg_sfx(r))
++         end do
++         do c = 1, ngr
++            do g = 1, 2
++               act_greg(s,c,g,r) = hist_fld_active(trim(nm(s,c,g))//'_PATH_'//reg_sfx(r))
++            end do
++         end do
++      end do
++   end do
++   do s = 1, nsb
++      do j = 1, nthr
++         do c = 1, nwb
++            act_cbin(s,c,j) = hist_fld_active(trim(nm(s,c,0))//'_CTT_T'//trim(thr_sfx(j)))
++         end do
++         do c = 1, ngr
++            do g = 1, 2
++               act_gbin(s,c,g,j) = hist_fld_active(trim(nm(s,c,g))//'_CTT_T'//trim(thr_sfx(j)))
++            end do
++         end do
++      end do
++   end do
++   act_cached = .true.
++end subroutine cache_active
++
++!=================================================================================
++
++subroutine out_bin(name, v, lchnk, ncol, j)
++   ! Column value v placed in the cloud-top bin of threshold j, 0 elsewhere.
++   use cam_history, only: outfld
++   character(len=*), intent(in) :: name
++   real(r8), intent(in) :: v(pcols)
++   integer,  intent(in) :: lchnk, ncol, j
++   real(r8) :: fb(pcols,ctd_nbin)
++   integer :: i
++   fb = 0._r8
++   do i = 1, ncol
++      if (wb_ibin(i,j,lchnk) > 0) fb(i,wb_ibin(i,j,lchnk)) = v(i)
++   end do
++   call outfld(name, fb, pcols, lchnk)
++end subroutine out_bin
++
++!=================================================================================
++
++subroutine ctd_wb_end(state, pbuf, dt)
++   ! End of tphysac: book the rest as OTHER, write rates, keep the layers for DYN/TEND.
++   use cam_history, only: outfld
++   type(physics_state), intent(in) :: state
++   type(physics_buffer_desc), pointer :: pbuf(:)
++   real(r8), intent(in) :: dt
++   real(r8), pointer :: wend(:,:,:)
++   real(r8) :: w(pcols,ns), f(pcols), dm(pcols,pver,ns)
++   integer :: c, s, g, r, j, i, lchnk, ncol
++   if (.not. wb_on) return
++   if (.not. act_cached) call cache_active()
++   lchnk = state%lchnk
++   ncol  = state%ncol
++   call ctd_wb_mark(state, wb_other)
++   call pbuf_get_field(pbuf, wend_idx, wend)
++   w = 0._r8
++   w(:ncol,:) = sum(mlast(:ncol,:,:,lchnk), dim=2)
++   ! TEND per regime from the begin-of-step classification; first step: sum of categories.
++   dm = 0._r8
++   do i = 1, ncol
++      if (wend(i,1,1) >= 0._r8) dm(i,:,:) = mlast(i,:,:,lchnk) - wend(i,:,:)
++   end do
++   call book(lchnk, ncol, wb_tend, dm, .false.)
++   do i = 1, ncol
++      if (wend(i,1,1) < 0._r8) acc(i,:,wb_tend,:,lchnk) = sum(acc(i,:,1:nwb-1,:,lchnk), dim=2)
++   end do
++   do s = 1, ns
++      do c = 1, nwb
++         f = 0._r8
++         f(:ncol) = acc(:ncol,s,c,0,lchnk)/dt
++         call outfld(trim(nm(s,c,0))//'_PATH', f, pcols, lchnk)
++         if (s <= nsb) then
++            do j = 1, nthr
++               if (act_cbin(s,c,j)) call out_bin(trim(nm(s,c,0))//'_CTT_T'//trim(thr_sfx(j)), f, lchnk, ncol, j)
++            end do
++         end if
++         do r = 1, nreg
++            if (.not. act_creg(s,c,r)) cycle
++            f(:ncol) = acc(:ncol,s,c,r,lchnk)/dt
++            call outfld(trim(nm(s,c,0))//'_PATH_'//reg_sfx(r), f, pcols, lchnk)
++         end do
++      end do
++      do c = 1, ngr
++         do g = 1, 2
++            f = 0._r8
++            if (g == 1) then
++               f(:ncol) = gsrc(:ncol,s,c,0,lchnk)/dt
++            else
++               f(:ncol) = gsnk(:ncol,s,c,0,lchnk)/dt
++            end if
++            call outfld(trim(nm(s,c,g))//'_PATH', f, pcols, lchnk)
++            if (s <= nsb) then
++               do j = 1, nthr
++                  if (act_gbin(s,c,g,j)) call out_bin(trim(nm(s,c,g))//'_CTT_T'//trim(thr_sfx(j)), f, lchnk, ncol, j)
++               end do
++            end if
++            do r = 1, nreg
++               if (.not. act_greg(s,c,g,r)) cycle
++               if (g == 1) then
++                  f(:ncol) = gsrc(:ncol,s,c,r,lchnk)/dt
++               else
++                  f(:ncol) = gsnk(:ncol,s,c,r,lchnk)/dt
++               end if
++               call outfld(trim(nm(s,c,g))//'_PATH_'//reg_sfx(r), f, pcols, lchnk)
++            end do
++         end do
++      end do
++      call outfld('W'//trim(sp_name(s))//'_END', w(:,s), pcols, lchnk)
++   end do
++   wend(:ncol,:,:) = mlast(:ncol,:,:,lchnk)
++   acc(:,:,:,:,lchnk) = 0._r8
++   gsrc(:,:,:,:,lchnk) = 0._r8
++   gsnk(:,:,:,:,lchnk) = 0._r8
++end subroutine ctd_wb_end
++
++end module ctd_water_budget

@@ -1,0 +1,23 @@
+diff --git a/src/physics/cam/cam_diagnostics.F90 b/src/physics/cam/cam_diagnostics.F90
+index df039cf..9ca1f4b 100644
+--- a/src/physics/cam/cam_diagnostics.F90
++++ b/src/physics/cam/cam_diagnostics.F90
+@@ -1497,6 +1497,7 @@ contains
+     !-----------------------------------------------------------------------
+     use physconst,     only: cpair
+     use tidal_diag,    only: get_tidal_coeffs
++    use cloud_top_diag, only: ctd_on, cloud_top_diag_bin2d
+ 
+     ! Arguments:
+ 
+@@ -1625,6 +1626,10 @@ contains
+       call outfld('PRECSL  ', snowl, pcols, lchnk )
+       call outfld('PRECT   ', prect, pcols, lchnk )
+       call outfld('PRECTMX ', prect, pcols, lchnk )
++      if (ctd_on) then   ! per cloud-top bin (MG2 ran earlier in tphysbc)
++         call cloud_top_diag_bin2d('PRECT', prect, ncol, lchnk, pbuf)
++         call cloud_top_diag_bin2d('PRECC', precc, ncol, lchnk, pbuf)
++      end if
+ 
+       call outfld('PRECLav ', precl, pcols, lchnk )
+       call outfld('PRECCav ', precc, pcols, lchnk )

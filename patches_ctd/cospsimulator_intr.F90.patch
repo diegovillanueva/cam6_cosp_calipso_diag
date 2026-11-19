@@ -1,0 +1,164 @@
+diff --git a/src/physics/cam/cospsimulator_intr.F90 b/src/physics/cam/cospsimulator_intr.F90
+index 89c2ed3..2e837db 100644
+--- a/src/physics/cam/cospsimulator_intr.F90
++++ b/src/physics/cam/cospsimulator_intr.F90
+@@ -846,6 +846,8 @@ CONTAINS
+             flag_xyfill=.true., fill_value=R_UNDEF)
+        call addfld('ACT_ITF_CAL', horiz_only, 'I', 'fraction', 'CALIPSO Cloud Top Ice Cover Fraction',    &
+             flag_xyfill=.true., fill_value=R_UNDEF)
++       ! COSPTOP: lidar cloud-top phase binned by cloud-top temperature ('A', zero-fill), only with ctd_on.
++       call cosp_top_addfld()
+ 
+ !       ! Calipso Opaque/thin cloud diagnostics
+ !       call addfld('CLDOPQ_CAL',      horiz_only,    'A', 'percent', 'CALIPSO Opaque Cloud Cover',       &
+@@ -1351,6 +1353,7 @@ CONTAINS
+     real(r8) :: ctp_cal(pcols)                           ! CALIPSO cloud top pressure (Pa)
+     real(r8) :: acitf_cal(pcols)                         ! CALIPSO cloud top ice cover fraction
+     real(r8) :: wt_cal                                   ! interpolation weight for cloud top T/P
++    integer  :: ktop_cal(pcols)                          ! cosp_ht index of the lidar cloud top, 0 if none
+     real(r8) :: lat_cosp(pcols)                          ! lat for cosp (degrees_north)
+     real(r8) :: lon_cosp(pcols)                          ! lon for cosp (degrees_east)
+     real(r8) :: landmask(pcols)                          ! landmask (0 or 1)
+@@ -2711,6 +2714,7 @@ CONTAINS
+        ctt_cal(:ncol)   = R_UNDEF
+        ctp_cal(:ncol)   = R_UNDEF
+        acitf_cal(:ncol) = R_UNDEF
++       ktop_cal(:)      = 0
+        do i = 1, ncol
+           do k = 1, nht_cosp   ! k=1 is highest altitude (COSP top-to-bottom convention)
+              if (cld_cal(i,k) > 0.01_r8) then
+@@ -2728,6 +2732,7 @@ CONTAINS
+                 if (cld_cal_ice(i,k) + cld_cal_liq(i,k) > 0.0_r8) then
+                    acitf_cal(i) = cld_cal_ice(i,k) / (cld_cal_ice(i,k) + cld_cal_liq(i,k))
+                 end if
++                ktop_cal(i) = k
+                 exit
+              end if
+           end do
+@@ -2735,6 +2740,8 @@ CONTAINS
+        call outfld('ACTT_CAL',    ctt_cal,   pcols, lchnk)
+        call outfld('ACTP_CAL',    ctp_cal,   pcols, lchnk)
+        call outfld('ACT_ITF_CAL', acitf_cal, pcols, lchnk)
++       ! COSPTOP: same top (ACTT_CAL rule) accumulated per ctt_bin of ACTT_CAL (A1) and of the MG2 top (A2).
++       call cosp_top_run(ncol, lchnk, pbuf, ktop_cal, ctt_cal, cld_cal, cld_cal_ice, cld_cal_liq, cld_cal_un)
+ 
+     end if
+ 
+@@ -3857,6 +3864,117 @@ CONTAINS
+      endif
+         
+    end subroutine destroy_cosp_outputs
++
++  ! ######################################################################################
++  ! SUBROUTINE cosp_top_addfld  (COSPTOP, plan.ctd_cosp_top.md option A1 + A2)
++  ! ######################################################################################
++  subroutine cosp_top_addfld()
++
++    ! Register the COSP lidar cloud-top phase fields on the ctd 'ctt_bin' axis; no-op without ctd_on.
++    ! h0 levels: NCALL/N/ICE/LIQ_CAL_CTT = 2 (ratio inputs), everything else = 3.
++    use cam_history,    only: addfld, horiz_only
++    use cloud_top_diag, only: ctd_on, ctd_combo_thr, ctd_addfld_default
++
++    character(len=8) :: sa2
++    character(len=*), parameter :: lp = 'CTD:COSPTOP | '
++
++    if (.not. ctd_on) return
++    write(sa2, '(a,i0)') '_T', ctd_combo_thr
++
++    call addfld('NCALL_CAL', horiz_only, 'A', '1', lp//'1 on COSP lidar calls, 0 never written otherwise')
++    call ctd_addfld_default('NCALL_CAL', 2)
++    ! A1: bin = ctt_bin of ACTT_CAL (lidar top = highest cosp_ht level with CLD_CAL > 0.01 %)
++    call addfld('N_CAL_CTT',   (/'ctt_bin'/), 'A', '1', lp//'Occurrence of a lidar cloud top in ACTT_CAL bin')
++    call addfld('ICE_CAL_CTT', (/'ctt_bin'/), 'A', '1', lp//'CLD_CAL_ICE/100 at the lidar cloud top, ACTT_CAL bin')
++    call addfld('LIQ_CAL_CTT', (/'ctt_bin'/), 'A', '1', lp//'CLD_CAL_LIQ/100 at the lidar cloud top, ACTT_CAL bin')
++    call addfld('UN_CAL_CTT',  (/'ctt_bin'/), 'A', '1', lp//'CLD_CAL_UN/100 at the lidar cloud top, ACTT_CAL bin')
++    call addfld('CVF_CAL_CTT', (/'ctt_bin'/), 'A', '1', lp//'CLD_CAL/100 at the lidar cloud top, ACTT_CAL bin')
++    call addfld('CTT_CAL_CTT', (/'ctt_bin'/), 'A', 'K', lp//'ACTT_CAL summed in its own bin (divide by N_CAL_CTT)')
++    call ctd_addfld_default('N_CAL_CTT',   2)
++    call ctd_addfld_default('ICE_CAL_CTT', 2)
++    call ctd_addfld_default('LIQ_CAL_CTT', 2)
++    call ctd_addfld_default('UN_CAL_CTT',  3)
++    call ctd_addfld_default('CVF_CAL_CTT', 3)
++    call ctd_addfld_default('CTT_CAL_CTT', 3)
++    ! A2: same lidar-top quantities, bin = MG2 cloud-top bin CTD_IBIN at T<ctd_combo_thr>
++    call addfld('N_CAL_CTT'//trim(sa2),   (/'ctt_bin'/), 'A', '1', lp//'Occurrence of a lidar cloud top in MG2 top bin')
++    call addfld('ICE_CAL_CTT'//trim(sa2), (/'ctt_bin'/), 'A', '1', lp//'CLD_CAL_ICE/100 at the lidar cloud top, MG2 top bin')
++    call addfld('LIQ_CAL_CTT'//trim(sa2), (/'ctt_bin'/), 'A', '1', lp//'CLD_CAL_LIQ/100 at the lidar cloud top, MG2 top bin')
++    call addfld('UN_CAL_CTT'//trim(sa2),  (/'ctt_bin'/), 'A', '1', lp//'CLD_CAL_UN/100 at the lidar cloud top, MG2 top bin')
++    call addfld('CVF_CAL_CTT'//trim(sa2), (/'ctt_bin'/), 'A', '1', lp//'CLD_CAL/100 at the lidar cloud top, MG2 top bin')
++    call ctd_addfld_default('N_CAL_CTT'//trim(sa2),   3)
++    call ctd_addfld_default('ICE_CAL_CTT'//trim(sa2), 3)
++    call ctd_addfld_default('LIQ_CAL_CTT'//trim(sa2), 3)
++    call ctd_addfld_default('UN_CAL_CTT'//trim(sa2),  3)
++    call ctd_addfld_default('CVF_CAL_CTT'//trim(sa2), 3)
++
++  end subroutine cosp_top_addfld
++
++  ! ######################################################################################
++  ! SUBROUTINE cosp_top_run  (COSPTOP)
++  ! ######################################################################################
++  subroutine cosp_top_run(ncol, lchnk, pbuf, ktop, ctt, cld, ice, liq, un)
++
++    ! Zero-filled per-bin copies of the lidar-top cloud/phase fractions (percent -> fraction);
++    ! 'A' means are per COSP call (outfld only on COSP steps), NCALL_CAL documents that denominator.
++    use cam_history,     only: outfld
++    use physics_buffer,  only: physics_buffer_desc
++    use cloud_top_diag,  only: ctd_on, ctd_nbin, ctd_combo_thr, bin_of, ctd_cosp_top_ibin
++    use mod_cosp_config, only: R_UNDEF
++
++    integer,                   intent(in) :: ncol, lchnk
++    type(physics_buffer_desc), pointer    :: pbuf(:)
++    integer,                   intent(in) :: ktop(pcols)
++    real(r8),                  intent(in) :: ctt(pcols)
++    real(r8),                  intent(in) :: cld(:,:), ice(:,:), liq(:,:), un(:,:)
++
++    real(r8) :: one(pcols), f(pcols, ctd_nbin, 6), g(pcols, ctd_nbin, 5)
++    integer  :: i, k, b, ib2(pcols)
++    character(len=8) :: sa2
++
++    if (.not. ctd_on) return
++    write(sa2, '(a,i0)') '_T', ctd_combo_thr
++    call ctd_cosp_top_ibin(pbuf, ncol, ib2)
++    one(:) = 1._r8
++    f(:,:,:) = 0._r8
++    g(:,:,:) = 0._r8
++    do i = 1, ncol
++       k = ktop(i)
++       if (k < 1) cycle
++       if (ctt(i) /= R_UNDEF) then
++          b = bin_of(ctt(i))
++          if (b > 0) then
++             f(i,b,1) = 1._r8
++             f(i,b,2) = 0.01_r8*ice(i,k)
++             f(i,b,3) = 0.01_r8*liq(i,k)
++             f(i,b,4) = 0.01_r8*un(i,k)
++             f(i,b,5) = 0.01_r8*cld(i,k)
++             f(i,b,6) = ctt(i)
++          end if
++       end if
++       b = ib2(i)
++       if (b > 0) then
++          g(i,b,1) = 1._r8
++          g(i,b,2) = 0.01_r8*ice(i,k)
++          g(i,b,3) = 0.01_r8*liq(i,k)
++          g(i,b,4) = 0.01_r8*un(i,k)
++          g(i,b,5) = 0.01_r8*cld(i,k)
++       end if
++    end do
++    call outfld('NCALL_CAL',   one,       pcols, lchnk)
++    call outfld('N_CAL_CTT',   f(:,:,1),  pcols, lchnk)
++    call outfld('ICE_CAL_CTT', f(:,:,2),  pcols, lchnk)
++    call outfld('LIQ_CAL_CTT', f(:,:,3),  pcols, lchnk)
++    call outfld('UN_CAL_CTT',  f(:,:,4),  pcols, lchnk)
++    call outfld('CVF_CAL_CTT', f(:,:,5),  pcols, lchnk)
++    call outfld('CTT_CAL_CTT', f(:,:,6),  pcols, lchnk)
++    call outfld('N_CAL_CTT'//trim(sa2),   g(:,:,1), pcols, lchnk)
++    call outfld('ICE_CAL_CTT'//trim(sa2), g(:,:,2), pcols, lchnk)
++    call outfld('LIQ_CAL_CTT'//trim(sa2), g(:,:,3), pcols, lchnk)
++    call outfld('UN_CAL_CTT'//trim(sa2),  g(:,:,4), pcols, lchnk)
++    call outfld('CVF_CAL_CTT'//trim(sa2), g(:,:,5), pcols, lchnk)
++
++  end subroutine cosp_top_run
+ #endif
+ 
+ !#######################################################################

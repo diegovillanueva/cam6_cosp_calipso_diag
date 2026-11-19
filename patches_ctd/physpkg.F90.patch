@@ -1,0 +1,99 @@
+diff --git a/src/physics/cam/physpkg.F90 b/src/physics/cam/physpkg.F90
+index cfbc447..912d914 100644
+--- a/src/physics/cam/physpkg.F90
++++ b/src/physics/cam/physpkg.F90
+@@ -1237,6 +1237,7 @@ contains
+     !   o Ion Drag ( Only for WACCM )
+     !   o Scale Dry Mass Energy
+     !-----------------------------------------------------------------------
++    use ctd_water_budget, only: ctd_wb_end
+     use physics_buffer, only: physics_buffer_desc, pbuf_set_field, pbuf_get_index, pbuf_get_field, pbuf_old_tim_idx
+     use shr_kind_mod,       only: r8 => shr_kind_r8
+     use chemistry,          only: chem_is_active, chem_timestep_tend, chem_emissions
+@@ -1629,6 +1630,9 @@ contains
+ 
+     call clybry_fam_set( ncol, lchnk, map2chm, state%q, pbuf )
+ 
++    ! ctd water budget: rest of the step as OTHER, write the budget fields
++    call ctd_wb_end(state, pbuf, ztodt)
++
+   end subroutine tphysac
+ 
+   subroutine tphysbc (ztodt, state,  &
+@@ -1661,6 +1665,7 @@ contains
+     !
+     !-----------------------------------------------------------------------
+ 
++    use ctd_water_budget, only: ctd_wb_begin, ctd_wb_mark, wb_zm, wb_shcu, wb_clubb, wb_mg2, wb_other
+     use physics_buffer,  only: physics_buffer_desc, pbuf_get_field
+     use physics_buffer,  only: pbuf_get_index, pbuf_old_tim_idx
+     use physics_buffer,  only: col_type_subcol, dyn_time_lvls
+@@ -1851,6 +1856,9 @@ contains
+     if (state_debug_checks) &
+          call physics_state_check(state, name="before tphysbc (dycore?)")
+ 
++    ! ctd water budget: column CLDLIQ/CLDICE change since the end of tphysac = dynamics
++    call ctd_wb_begin(state, pbuf)
++
+     call clybry_fam_adj( ncol, lchnk, map2chm, state%q, pbuf )
+ 
+     ! Since clybry_fam_adj operates directly on the tracers, and has no
+@@ -1925,6 +1933,7 @@ contains
+ 
+     call t_startf ('convect_deep_tend')
+ 
++    call ctd_wb_mark(state, wb_other)
+     call convect_deep_tend(  &
+          cmfmc,      cmfcme,             &
+          pflx,    zdu,       &
+@@ -1933,6 +1942,7 @@ contains
+          state,   ptend, cam_in%landfrac, pbuf)
+ 
+     call physics_update(state, ptend, ztodt, tend)
++    call ctd_wb_mark(state, wb_zm)
+ 
+     call t_stopf('convect_deep_tend')
+ 
+@@ -1976,6 +1986,7 @@ contains
+     call t_stopf ('convect_shallow_tend')
+ 
+     call physics_update(state, ptend, ztodt, tend)
++    call ctd_wb_mark(state, wb_shcu)
+ 
+     flx_cnd(:ncol) = prec_sh(:ncol) + rliq2(:ncol)
+     call check_energy_chng(state, tend, "convect_shallow", nstep, ztodt, zero, flx_cnd, snow_sh, zero)
+@@ -2048,6 +2059,7 @@ contains
+        prec_pcw_macmic = 0._r8
+        snow_pcw_macmic = 0._r8
+ 
++       call ctd_wb_mark(state, wb_other)
+        do macmic_it = 1, cld_macmic_num_steps
+ 
+           !===================================================
+@@ -2109,6 +2121,7 @@ contains
+              ! Update physics tendencies and copy state to state_eq, because that is
+              ! input for microphysics
+              call physics_update(state, ptend, ztodt, tend)
++             call ctd_wb_mark(state, wb_clubb)
+ 
+              ! Use actual qflux (not lhf/latvap) for consistency with surface fluxes and revised code
+              call check_energy_chng(state, tend, "clubb_tend", nstep, ztodt, &
+@@ -2179,6 +2192,7 @@ contains
+           call physics_ptend_scale(ptend, 1._r8/cld_macmic_num_steps, ncol)
+ 
+           call physics_update (state, ptend, ztodt, tend)
++          call ctd_wb_mark(state, wb_mg2)
+           call check_energy_chng(state, tend, "microp_tend", nstep, ztodt, &
+                zero, prec_str(:ncol)/cld_macmic_num_steps, &
+                snow_str(:ncol)/cld_macmic_num_steps, zero)
+@@ -2241,8 +2255,10 @@ contains
+        end if
+ 
+        call t_startf ('convect_deep_tend2')
++       call ctd_wb_mark(state, wb_other)
+        call convect_deep_tend_2( state,   ptend,  ztodt,  pbuf )
+        call physics_update(state, ptend, ztodt, tend)
++       call ctd_wb_mark(state, wb_zm)
+        call t_stopf ('convect_deep_tend2')
+ 
+        ! check tracer integrals

@@ -1,0 +1,17 @@
+diff --git a/bld/namelist_files/namelist_defaults_cam.xml b/bld/namelist_files/namelist_defaults_cam.xml
+index 823f2ba..9f0a1f2 100644
+--- a/bld/namelist_files/namelist_defaults_cam.xml
++++ b/bld/namelist_files/namelist_defaults_cam.xml
+@@ -1966,4 +1966,12 @@
+ 
+ <focndomain hgrid="1.9x2.5" ocn="som">atm/cam/ocnfrac/domain.aqua.fv1.9x2.5.nc</focndomain>
+ 
++<!-- Cloud-top diagnostics (cloud_top_diag.F90) -->
++<ctd_on             > .false.            </ctd_on>
++<ctd_qthr           > 1.e-7,1.e-6,1.e-5  </ctd_qthr>
++<ctd_mask_incl_snow > .false.            </ctd_mask_incl_snow>
++<ctd_ctt_bin0       > 180.               </ctd_ctt_bin0>
++<ctd_dbin           > 3.                 </ctd_dbin>
++<ctd_nbin           > 40                 </ctd_nbin>
++
+ </namelist_defaults>

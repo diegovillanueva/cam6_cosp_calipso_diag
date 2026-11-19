@@ -1,0 +1,58 @@
+diff --git a/src/physics/cam/micro_mg2_0.F90 b/src/physics/cam/micro_mg2_0.F90
+index fe87fb9..8fc4a69 100644
+--- a/src/physics/cam/micro_mg2_0.F90
++++ b/src/physics/cam/micro_mg2_0.F90
+@@ -410,7 +410,9 @@ subroutine micro_mg_tend ( &
+      errstring, & ! Below arguments are "optional" (pass null pointers to omit).
+      tnd_qsnow,          tnd_nsnow,          re_ice,             &
+      prer_evap,                                                      &
+-     frzimm,             frzcnt,             frzdep)
++     frzimm,             frzcnt,             frzdep,             &
++     ctd_mnuccdgtot,     ctd_mnudeptot,      ctd_mnuccritot,     &
++     ctd_nnuccctot,      ctd_nnuccttot,      ctd_nnudeptot)
+ 
+   ! Constituent properties.
+   use micro_mg_utils, only: &
+@@ -602,6 +604,14 @@ subroutine micro_mg_tend ( &
+   real(r8), intent(in) :: frzcnt(:,:) ! Number tendency due to contact freezing (1/cm3)
+   real(r8), intent(in) :: frzdep(:,:) ! Number tendency due to deposition nucleation (1/cm3)
+ 
++  ! Grid-mean rates for cloud_top_diag that the *tot outputs above do not carry.
++  real(r8), intent(out) :: ctd_mnuccdgtot(mgncol,nlev) ! vapour -> ice by nucleation, grid-mean (kg/kg/s); mnuccdtot carries icldm twice
++  real(r8), intent(out) :: ctd_mnudeptot(mgncol,nlev)  ! vapour -> ice by hetfrz deposition freezing (kg/kg/s)
++  real(r8), intent(out) :: ctd_mnuccritot(mgncol,nlev) ! rain -> cloud ice by heterogeneous freezing (kg/kg/s)
++  real(r8), intent(out) :: ctd_nnuccctot(mgncol,nlev)  ! droplet number frozen by immersion freezing (1/kg/s)
++  real(r8), intent(out) :: ctd_nnuccttot(mgncol,nlev)  ! droplet number frozen by contact freezing (1/kg/s)
++  real(r8), intent(out) :: ctd_nnudeptot(mgncol,nlev)  ! ice number from hetfrz deposition freezing (1/kg/s)
++
+   ! local workspace
+   ! all units mks unless otherwise stated
+ 
+@@ -972,6 +982,12 @@ subroutine micro_mg_tend ( &
+   meltsdttot=0._r8
+   frzrdttot=0._r8
+   mnuccdtot=0._r8
++  ctd_mnuccdgtot=0._r8
++  ctd_mnudeptot=0._r8
++  ctd_mnuccritot=0._r8
++  ctd_nnuccctot=0._r8
++  ctd_nnuccttot=0._r8
++  ctd_nnudeptot=0._r8
+ 
+   rflx=0._r8
+   sflx=0._r8
+@@ -1959,6 +1975,14 @@ subroutine micro_mg_tend ( &
+         pracstot(i,k) = pracs(i,k)*precip_frac(i,k)
+         mnuccrtot(i,k) = mnuccr(i,k)*precip_frac(i,k)
+ 
++        ! Same weighting as in qitend/nctend/nitend above.
++        ctd_mnuccdgtot(i,k) = mnuccd(i,k)
++        ctd_mnudeptot(i,k)  = mnudep(i,k)*lcldm(i,k)
++        ctd_mnuccritot(i,k) = mnuccri(i,k)*precip_frac(i,k)
++        ctd_nnuccctot(i,k)  = nnuccc(i,k)*lcldm(i,k)
++        ctd_nnuccttot(i,k)  = nnucct(i,k)*lcldm(i,k)
++        ctd_nnudeptot(i,k)  = nnudep(i,k)*lcldm(i,k)
++
+ 
+         nctend(i,k) = nctend(i,k)+&
+              (-nnuccc(i,k)-nnucct(i,k)-npsacws(i,k)+nsubc(i,k) &

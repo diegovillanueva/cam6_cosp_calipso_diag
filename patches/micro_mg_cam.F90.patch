@@ -1,0 +1,165 @@
+diff --git a/src/physics/cam/micro_mg_cam.F90 b/src/physics/cam/micro_mg_cam.F90
+index 3a6ddcf..7c67167 100644
+--- a/src/physics/cam/micro_mg_cam.F90
++++ b/src/physics/cam/micro_mg_cam.F90
+@@ -845,6 +845,14 @@ subroutine micro_mg_cam_init(pbuf2d)
+    call addfld ('ACTREI',      horiz_only,   'A', 'Micron',   'Average Cloud Top ice effective radius'                            )
+    call addfld ('ACTNL',       horiz_only,   'A', 'm-3',   'Average Cloud Top droplet number'                                  )
+    call addfld ('ACTNI',       horiz_only,   'A', 'm-3',   'Average Cloud Top ice number'                                      )
++   call addfld ('ACTT',        horiz_only,   'I', 'K',    'Stratiform Cloud Top Temperature', &
++                flag_xyfill=.true., fill_value=1.e36_r8)
++   call addfld ('ACTP',        horiz_only,   'I', 'Pa',   'Stratiform Cloud Top Pressure', &
++                flag_xyfill=.true., fill_value=1.e36_r8)
++   call addfld ('ACT_NITF',   horiz_only,   'I', 'fraction', 'Cloud Top Ice Number Fraction', &
++                flag_xyfill=.true., fill_value=1.e36_r8)
++   call addfld ('ACT_ITMF',   horiz_only,   'I', 'fraction', 'Cloud Top Ice Mass Fraction', &
++                flag_xyfill=.true., fill_value=1.e36_r8)
+ 
+    call addfld ('FCTL',        horiz_only,   'A', 'fraction', 'Fractional occurrence of cloud top liquid'                         )
+    call addfld ('FCTI',        horiz_only,   'A', 'fraction', 'Fractional occurrence of cloud top ice'                            )
+@@ -1447,6 +1455,7 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+ 
+    real(r8) :: icecldf(state%psetcols,pver) ! Ice cloud fraction
+    real(r8) :: liqcldf(state%psetcols,pver) ! Liquid cloud fraction (combined into cloud)
++   real(r8) :: totcldf(state%psetcols,pver) ! Total cloud fraction
+ 
+    real(r8), pointer :: rel(:,:)          ! Liquid effective drop radius (microns)
+    real(r8), pointer :: rei(:,:)          ! Ice effective drop size (microns)
+@@ -1465,6 +1474,7 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+ 
+    real(r8) :: icimrst(state%psetcols,pver) ! In stratus ice mixing ratio
+    real(r8) :: icwmrst(state%psetcols,pver) ! In stratus water mixing ratio
++   real(r8) :: ictmrst(state%psetcols,pver) ! In stratus total water mixing ratio
+    real(r8) :: icinc(state%psetcols,pver)   ! In cloud ice number conc
+    real(r8) :: icwnc(state%psetcols,pver)   ! In cloud water number conc
+ 
+@@ -1500,6 +1510,10 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+    real(r8) :: ctnl_grid(pcols)
+    real(r8) :: ctni_grid(pcols)
+    real(r8) :: fcti_grid(pcols)
++   real(r8) :: ctt_grid(pcols)     ! cloud top temperature
++   real(r8) :: ctp_grid(pcols)     ! cloud top pressure
++   real(r8) :: acnitf_grid(pcols)  ! cloud top ice number fraction
++   real(r8) :: acitf_grid(pcols)   ! cloud top ice mass fraction (ACT_ITMF)
+    real(r8) :: fctl_grid(pcols)
+ 
+    real(r8) :: ftem_grid(pcols,pver)
+@@ -1529,6 +1543,8 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+ 
+    real(r8) :: icimrst_grid(pcols,pver) ! stratus ice mixing ratio - on grid
+    real(r8) :: icwmrst_grid(pcols,pver) ! stratus water mixing ratio - on grid
++   real(r8) :: ictmrst_grid(pcols,pver) ! stratus total water mixing ratio - on grid
++   real(r8) :: totcldf_grid(pcols,pver) ! Grid of total cloud fraction for each column and vertical level
+ 
+    real(r8), pointer :: lambdac_grid(:,:)
+    real(r8), pointer :: mu_grid(:,:)
+@@ -2275,6 +2291,7 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+ 
+    icecldf(:ncol,top_lev:pver) = ast(:ncol,top_lev:pver)
+    liqcldf(:ncol,top_lev:pver) = ast(:ncol,top_lev:pver)
++   totcldf(:ncol,top_lev:pver) = ast(:ncol,top_lev:pver)
+ 
+    ! ------------------------------------------------------------ !
+    ! Compute in cloud ice and liquid mixing ratios                !
+@@ -2294,6 +2311,7 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+          ! in-cloud mixing ratio maximum limit of 0.005 kg/kg
+          icimrst(i,k)   = min( state_loc%q(i,k,ixcldice) / max(mincld,icecldf(i,k)),0.005_r8 )
+          icwmrst(i,k)   = min( state_loc%q(i,k,ixcldliq) / max(mincld,liqcldf(i,k)),0.005_r8 )
++         ictmrst(i,k)   = icimrst(i,k) + icwmrst(i,k)
+          icinc(i,k)     = state_loc%q(i,k,ixnumice) / max(mincld,icecldf(i,k)) * &
+               state_loc%pmid(i,k) / (287.15_r8*state_loc%t(i,k))
+          icwnc(i,k)     = state_loc%q(i,k,ixnumliq) / max(mincld,liqcldf(i,k)) * &
+@@ -2378,8 +2396,10 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+       call subcol_field_avg(praio,     ngrdcol, lchnk, praio_grid)
+       call subcol_field_avg(icwmrst,   ngrdcol, lchnk, icwmrst_grid)
+       call subcol_field_avg(icimrst,   ngrdcol, lchnk, icimrst_grid)
++      call subcol_field_avg(ictmrst,   ngrdcol, lchnk, ictmrst_grid)
+       call subcol_field_avg(liqcldf,   ngrdcol, lchnk, liqcldf_grid)
+       call subcol_field_avg(icecldf,   ngrdcol, lchnk, icecldf_grid)
++      call subcol_field_avg(totcldf,   ngrdcol, lchnk, totcldf_grid)
+       call subcol_field_avg(icwnc,     ngrdcol, lchnk, icwnc_grid)
+       call subcol_field_avg(icinc,     ngrdcol, lchnk, icinc_grid)
+       call subcol_field_avg(state_loc%pdel,            ngrdcol, lchnk, pdel_grid)
+@@ -2444,8 +2464,10 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+       praio_grid      = praio
+       icwmrst_grid    = icwmrst
+       icimrst_grid    = icimrst
++      ictmrst_grid    = ictmrst
+       liqcldf_grid    = liqcldf
+       icecldf_grid    = icecldf
++      totcldf_grid    = totcldf
+       icwnc_grid      = icwnc
+       icinc_grid      = icinc
+       pdel_grid       = state_loc%pdel
+@@ -2754,6 +2776,7 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+    ! History Output Fields !
+    ! --------------------- !
+ 
++
+    ! Column droplet concentration
+    cdnumc_grid(:ngrdcol) = sum(nc_grid(:ngrdcol,top_lev:pver) * &
+         pdel_grid(:ngrdcol,top_lev:pver)/gravit, dim=2)
+@@ -2810,14 +2833,37 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+    fctm_grid  = 0._r8
+    fctsl_grid = 0._r8
+    fctslm_grid= 0._r8
++   ! Fill value 1.e36 where no cloud top is found
++   ctt_grid    = 1.e36_r8
++   ctp_grid    = 1.e36_r8
++   acnitf_grid = 1.e36_r8
++   acitf_grid  = 1.e36_r8
+ 
+    do i = 1, ngrdcol
+       do k = top_lev, pver
+-         if ( liqcldf_grid(i,k) > 0.01_r8 .and. icwmrst_grid(i,k) > 1.e-7_r8 ) then
++         ! Cloud top is the first layer with total (liquid + ice) in-cloud water above 1.e-5 kg/kg;
++         ! liquid and ice cloud-top properties are taken from this same layer.
++         if ( totcldf_grid(i,k) > 0.01_r8 .and. ictmrst_grid(i,k) > 1.e-5_r8 ) then
+             ctrel_grid(i) = rel_grid(i,k) * liqcldf_grid(i,k)
+             ctnl_grid(i)  = icwnc_grid(i,k) * liqcldf_grid(i,k)
+             fctl_grid(i)  = liqcldf_grid(i,k)
+ 
++            ctrei_grid(i) = rei_grid(i,k) * icecldf_grid(i,k)
++            ctni_grid(i)  = icinc_grid(i,k) * icecldf_grid(i,k)
++            fcti_grid(i)  = icecldf_grid(i,k)
++            ctt_grid(i)   = state_loc%t(i,k)     ! cloud top temperature
++            ctp_grid(i)   = state_loc%pmid(i,k)  ! cloud top pressure
++            ! ACT_NITF = ACTNI / (ACTNL + ACTNI)
++            if (ctni_grid(i) + ctnl_grid(i) > 0._r8) then
++               acnitf_grid(i) = ctni_grid(i) / (ctni_grid(i) + ctnl_grid(i))
++            end if
++            ! ACT_ITMF = in-cloud ice mass / (ice + liquid) at cloud top
++            ! icecldf == liqcldf == ast always in MG, so cloud fractions cancel;
++            ! must use mixing ratios to get a meaningful ice mass fraction.
++            if (icimrst_grid(i,k) + icwmrst_grid(i,k) > 0._r8) then
++               acitf_grid(i) = icimrst_grid(i,k) / (icimrst_grid(i,k) + icwmrst_grid(i,k))
++            end if
++
+             ! Cloud Top Mixed phase, supercooled liquid only and supercooled liquid mixed
+             if (freqi_grid(i,k) > 0.01_r8) then
+                fctm_grid(i)=min(liqcldf_grid(i,k),icecldf_grid(i,k))
+@@ -2831,13 +2877,6 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+ 
+             exit
+          end if
+-
+-         if ( icecldf_grid(i,k) > 0.01_r8 .and. icimrst_grid(i,k) > 1.e-7_r8 ) then
+-            ctrei_grid(i) = rei_grid(i,k) * icecldf_grid(i,k)
+-            ctni_grid(i)  = icinc_grid(i,k) * icecldf_grid(i,k)
+-            fcti_grid(i)  = icecldf_grid(i,k)
+-            exit
+-         end if
+       end do
+    end do
+ 
+@@ -2978,6 +3017,10 @@ subroutine micro_mg_cam_tend_pack(state, ptend, dtime, pbuf, mgncol, mgcols, nle
+    call outfld('ACTREI',      ctrei_grid,       pcols, lchnk)
+    call outfld('ACTNL',       ctnl_grid,        pcols, lchnk)
+    call outfld('ACTNI',       ctni_grid,        pcols, lchnk)
++   call outfld('ACTT',        ctt_grid,         pcols, lchnk)
++   call outfld('ACTP',        ctp_grid,         pcols, lchnk)
++   call outfld('ACT_NITF',   acnitf_grid,      pcols, lchnk)
++   call outfld('ACT_ITMF',   acitf_grid,        pcols, lchnk)
+    call outfld('FCTL',        fctl_grid,        pcols, lchnk)
+    call outfld('FCTI',        fcti_grid,        pcols, lchnk)
+    call outfld('ICINC',       icinc_grid,       pcols, lchnk)

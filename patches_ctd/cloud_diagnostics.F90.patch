@@ -1,0 +1,23 @@
+diff --git a/src/physics/cam/cloud_diagnostics.F90 b/src/physics/cam/cloud_diagnostics.F90
+index f7a5115..f5b6a8c 100644
+--- a/src/physics/cam/cloud_diagnostics.F90
++++ b/src/physics/cam/cloud_diagnostics.F90
+@@ -219,6 +219,7 @@ subroutine cloud_diagnostics_calc(state,  pbuf)
+     use cloud_cover_diags, only: cloud_cover_diags_out
+ 
+     use ref_pres,       only: top_lev=>trop_cloud_top_lev
++    use cloud_top_diag, only: ctd_on, cloud_top_diag_bin2d
+ 
+     implicit none
+ 
+@@ -487,6 +488,10 @@ subroutine cloud_diagnostics_calc(state,  pbuf)
+        call outfld('TGCLDCWP',tgwp   , pcols,lchnk)
+        call outfld('TGCLDLWP',tgliqwp, pcols,lchnk)
+        call outfld('TGCLDIWP',tgicewp, pcols,lchnk)
++       if (ctd_on) then   ! per cloud-top bin
++          call cloud_top_diag_bin2d('TGCLDLWP', tgliqwp, ncol, lchnk, pbuf)
++          call cloud_top_diag_bin2d('TGCLDIWP', tgicewp, ncol, lchnk, pbuf)
++       end if
+        call outfld('ICLDTWP' ,cwp    , pcols,lchnk)
+        call outfld('ICLDIWP' ,cicewp , pcols,lchnk)
+     endif

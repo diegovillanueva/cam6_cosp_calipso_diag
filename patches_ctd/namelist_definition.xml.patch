@@ -1,0 +1,65 @@
+diff --git a/bld/namelist_files/namelist_definition.xml b/bld/namelist_files/namelist_definition.xml
+index 777cb98..a258af6 100644
+--- a/bld/namelist_files/namelist_definition.xml
++++ b/bld/namelist_files/namelist_definition.xml
+@@ -7914,4 +7914,60 @@ production is also proportionally affected.
+ Default: 1.0
+ </entry>
+ 
++<!-- Cloud-top diagnostics (cloud_top_diag.F90) -->
++
++<entry id="ctd_on" type="logical" category="diagnostics"
++       group="cloud_top_diag_nl" valid_values="" >
++Master switch for the in-model cloud-top diagnostics (CTT/CTP/CVF/ILF/ISLF_T*,
++*_PATH, *_PATH_C/M/W, *_CTT_T*, *_TB). .false. leaves the run bit-for-bit upstream.
++Default: .false.
++</entry>
++
++<entry id="ctd_qthr" type="real(3)" category="diagnostics"
++       group="cloud_top_diag_nl" valid_values="" >
++Three cloud-top thresholds on grid-mean CLDLIQ+CLDICE [kg/kg]; field suffix T&lt;j&gt; is
++the negative exponent (1e-7 -> T7), so the three decades must differ.
++Default: 1.e-7,1.e-6,1.e-5
++</entry>
++
++<entry id="ctd_mask_incl_snow" type="logical" category="diagnostics"
++       group="cloud_top_diag_nl" valid_values="" >
++Add snow (SNOWQM) to the cloud-top mask.
++Default: .false.
++</entry>
++
++<entry id="ctd_ctt_bin0" type="real" category="diagnostics"
++       group="cloud_top_diag_nl" valid_values="" >
++Lower edge of the first ctt_bin [K].
++Default: 180.
++</entry>
++
++<entry id="ctd_dbin" type="real" category="diagnostics"
++       group="cloud_top_diag_nl" valid_values="" >
++Width of a ctt_bin [K].
++Default: 3.
++</entry>
++
++<entry id="ctd_nbin" type="integer" category="diagnostics"
++       group="cloud_top_diag_nl" valid_values="" >
++Number of ctt_bin bins.
++Default: 40
++</entry>
++
++<entry id="ctd_h0_default" type="integer" category="diagnostics"
++       group="cloud_top_diag_nl" valid_values="0,1,2,3" >
++With ctd_on, how much of the cloud-top diagnostics is added to the monthly h0 tape by
++default (add_default, no fincl needed): 0 nothing, 1 every 2-D field, 2 also the ctt_bin
++families of threshold T&lt;ctd_combo_thr&gt; and the *_TB fields, 3 everything (all thresholds,
++combined regime x bin family). empty_htapes=.true. discards the defaults.
++Default: 3
++</entry>
++
++<entry id="ctd_combo_thr" type="integer" category="diagnostics"
++       group="cloud_top_diag_nl" valid_values="" >
++Threshold exponent (5 for 1e-5 kg/kg) used by the combined &lt;VAR&gt;_&lt;C|M|W&gt;_CTT_T&lt;j&gt; family
++and by ctd_h0_default=2.
++Default: 5
++</entry>
++
+ </namelist_definition>
