@@ -1,7 +1,7 @@
 {
   "title": "cam6_cosp_calipso_diag: COSP/CALIPSO/CloudSat and cloud-top diagnostics for CESM2/CAM6",
   "description": "Output-only diagnostic patches for CESM 2.1.5 / CAM6 (CAM tag cam_cesm2_1_rel_60): COSP on every physics time step, CALIPSO and CloudSat cloud-top fields, MG2 cloud-top fields and an in-model cloud-top diagnostics module. The patches also correct the swapped CLD_CAL_TMPLIQ and CLD_CAL_TMPICE fields of stock CAM. They were used for the cloud-top phase evaluation of Villanueva et al. (in review).",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "upload_type": "software",
   "license": "BSD-3-Clause",
   "access_right": "open",
@@ -23,9 +23,29 @@
   ],
   "related_identifiers": [
     {
-      "identifier": "https://github.com/diegovillanueva/mg2_limiter_update",
-      "relation": "isSupplementTo",
+      "identifier": "https://github.com/diegovillanueva/cam6_cosp_calipso_diag/tree/v1.0.1",
+      "relation": "isIdenticalTo",
       "scheme": "url"
+    },
+    {
+      "identifier": "10.5281/zenodo.24365669",
+      "relation": "isSupplementTo",
+      "scheme": "doi"
+    },
+    {
+      "identifier": "10.5281/zenodo.24365680",
+      "relation": "references",
+      "scheme": "doi"
+    },
+    {
+      "identifier": "10.5281/zenodo.24365685",
+      "relation": "references",
+      "scheme": "doi"
+    },
+    {
+      "identifier": "10.5281/zenodo.24365774",
+      "relation": "isSupplementTo",
+      "scheme": "doi"
     }
   ]
 }

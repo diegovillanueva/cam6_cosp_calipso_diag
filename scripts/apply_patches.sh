@@ -2,7 +2,7 @@
 # Apply the COSP/CALIPSO/CloudSat and MG2 cloud-top diagnostic patches to a cam_cesm2_1_rel_60 checkout.
 # Usage: scripts/apply_patches.sh [--on-minimal [--ctd]] /path/to/cesm2.1.5/components/cam
 #   (default)     clean cam_cesm2_1_rel_60 checkout: patches/
-#   --on-minimal  checkout that already carries the mg2_limiter_update v1.0.1 patches:
+#   --on-minimal  checkout that already carries the mg2_limiter_update v1.0.3 patches:
 #                 patches/ with patches_on_minimal/micro_mg_cam.F90.patch in place of the standalone one
 #   --ctd         with --on-minimal, also apply the cloud-top diagnostics module (patches_ctd/)
 # The CAM directory must be the git checkout created by manage_externals/checkout_externals
@@ -23,7 +23,7 @@ while [[ "${1:-}" == --* ]]; do
 done
 cam="${1:?${usage}}"
 if [[ "${ctd}" -eq 1 && "${on_minimal}" -eq 0 ]]; then
-    echo "ERROR: --ctd needs --on-minimal (patches_ctd/ applies on top of mg2_limiter_update v1.0.1)" >&2
+    echo "ERROR: --ctd needs --on-minimal (patches_ctd/ applies on top of mg2_limiter_update v1.0.3)" >&2
     exit 1
 fi
 # shellcheck source=/dev/null

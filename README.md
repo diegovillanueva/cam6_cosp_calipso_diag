@@ -3,8 +3,8 @@
 Output-only diagnostics for CESM 2.1.5 / CAM6, distributed as patches against CAM tag `cam_cesm2_1_rel_60`:
 
 1. COSP on every physics time step and CALIPSO/CloudSat cloud-top diagnostics (`patches/`).
-2. MG2 cloud-top temperature, pressure and phase fields (`patches/`, or `patches_on_minimal/` on top of mg2_limiter_update v1.0.1).
-3. The in-model cloud-top diagnostics module `cloud_top_diag` (`patches_ctd/`, on top of mg2_limiter_update v1.0.1).
+2. MG2 cloud-top temperature, pressure and phase fields (`patches/`, or `patches_on_minimal/` on top of mg2_limiter_update v1.0.3).
+3. The in-model cloud-top diagnostics module `cloud_top_diag` (`patches_ctd/`, on top of mg2_limiter_update v1.0.3).
 
 ## Purpose
 
@@ -19,8 +19,8 @@ The CALIPSO-simulator cloud-top phase and the `cloud_top_diag` fields are used f
 | Path | Purpose |
 |---|---|
 | `patches/` | Standalone set (5 files) for a clean `cam_cesm2_1_rel_60` |
-| `patches_on_minimal/micro_mg_cam.F90.patch` | Replaces `patches/micro_mg_cam.F90.patch` on a tree that already carries mg2_limiter_update v1.0.1 |
-| `patches_ctd/` | Cloud-top diagnostics module (3 new files, 13 modified files); applies after mg2_limiter_update v1.0.1, `patches/` and `patches_on_minimal/` |
+| `patches_on_minimal/micro_mg_cam.F90.patch` | Replaces `patches/micro_mg_cam.F90.patch` on a tree that already carries mg2_limiter_update v1.0.3 |
+| `patches_ctd/` | Cloud-top diagnostics module (3 new files, 13 modified files); applies after mg2_limiter_update v1.0.3, `patches/` and `patches_on_minimal/` |
 | `scripts/apply_patches.sh` | Checks the CAM commit, then applies the selected set |
 | `docs/cosp_15m.md` | Design of the `cosp_15m` switch |
 | `versions.env` | CESM, CAM and source commit pins |
@@ -32,7 +32,7 @@ The CALIPSO-simulator cloud-top phase and the `cloud_top_diag` fields are used f
 - CESM 2.1.5 (`release-cesm2.1.5`) with CAM `cam_cesm2_1_rel_60` checked out by `manage_externals/checkout_externals`.
 - A COSP build (`./xmlchange --append CAM_CONFIG_OPTS=-cosp`) for the COSP fields.
 - The MG2 microphysics (`micro_mg_version = 2`, default in CAM6) and `use_subcol_microp = .false.` for `patches_ctd/`.
-- For `--on-minimal` and `--ctd`: the patches of [mg2_limiter_update](https://github.com/diegovillanueva/mg2_limiter_update) v1.0.1 applied first.
+- For `--on-minimal` and `--ctd`: the patches of [mg2_limiter_update](https://github.com/diegovillanueva/mg2_limiter_update) v1.0.3 applied first.
 - git and bash to apply the patches.
 - The patches are tested only on the MG2 microphysics stack (mg2_limiter_update); they were not tested with PUMAS (`micro_mg_version = 3`).
 
@@ -44,7 +44,7 @@ The CALIPSO-simulator cloud-top phase and the `cloud_top_diag` fields are used f
 | CAM | `cam_cesm2_1_rel_60` (`a03b84b7`) |
 | Source of `patches/`, `patches_on_minimal/` | the author's CAM development branch `dv_diag`, commit `e3bd85da` (tag `dv_diag-frozen-20261105`) |
 | Source of `patches_ctd/` | CAM development worktree, commit `b5195044` |
-| Base for `patches_on_minimal/`, `patches_ctd/` | mg2_limiter_update v1.0.1 (`e56c7bc9`) |
+| Base for `patches_on_minimal/`, `patches_ctd/` | mg2_limiter_update v1.0.3 (`cf6660b1`; code identical to v1.0.1) |
 
 All pins are in `versions.env`.
 
@@ -135,7 +135,7 @@ Archives from stock CAM, or from builds of `dv_diag` before the fix, need the tw
 ## Effect on model results
 
 - No change touches the model state or tendencies: everything is history output, and `cosp_15m` and `ctd_on` default to `.false.`.
-- One exception in the diagnostics: the standalone `patches/micro_mg_cam.F90.patch` carries the cloud-top definition that the `ACT*` fields need. Cloud top becomes the first layer with `totcldf > 0.01` and total in-cloud condensate `ictmrst > 1.e-5` kg/kg, instead of the stock separate liquid and ice tests (`> 1.e-7`). This changes the stock outputs `ACTREL`, `ACTNL`, `ACTREI`, `ACTNI`, `FCTL`, `FCTI`, `FCTM`, `FCTSL` and `FCTSLM`. The same definition is part of mg2_limiter_update v1.0.1, so the on-minimal variant adds fields only.
+- One exception in the diagnostics: the standalone `patches/micro_mg_cam.F90.patch` carries the cloud-top definition that the `ACT*` fields need. Cloud top becomes the first layer with `totcldf > 0.01` and total in-cloud condensate `ictmrst > 1.e-5` kg/kg, instead of the stock separate liquid and ice tests (`> 1.e-7`). This changes the stock outputs `ACTREL`, `ACTNL`, `ACTREI`, `ACTNI`, `FCTL`, `FCTI`, `FCTM`, `FCTSL` and `FCTSLM`. The same definition is part of mg2_limiter_update v1.0.3, so the on-minimal variant adds fields only.
 - With `cosp_15m = .true.`, five extra physics-buffer fields are registered and COSP sampling changes; radiation is unchanged.
 - `patches_ctd/` adds six `intent(out)` arguments to `micro_mg_tend` that copy existing rates; they do not feed back on the tendencies.
 - No bit-for-bit test was run for this repository; neutrality is argued from the code.
@@ -146,7 +146,7 @@ Archives from stock CAM, or from builds of `dv_diag` before the fix, need the tw
 # clean cam_cesm2_1_rel_60
 scripts/apply_patches.sh <CESM_ROOT>/components/cam
 
-# tree that already has mg2_limiter_update v1.0.1 applied
+# tree that already has mg2_limiter_update v1.0.3 applied
 scripts/apply_patches.sh --on-minimal <CESM_ROOT>/components/cam
 
 # same, plus the cloud-top diagnostics module
@@ -164,7 +164,7 @@ fincl2    = 'ACTT_CAL','ACTP_CAL','ACT_ITF_CAL','DBZE_CS_MEAN','DBZE_CS_LINMEAN'
 
 ## Validation
 
-- `git apply --check` passes for `patches/` on `cam_cesm2_1_rel_60` (`a03b84b7`), for `patches/` with `patches_on_minimal/` on top of mg2_limiter_update v1.0.1, and for `patches_ctd/` on top of that.
+- `git apply --check` passes for `patches/` on `cam_cesm2_1_rel_60` (`a03b84b7`), for `patches/` with `patches_on_minimal/` on top of mg2_limiter_update v1.0.3, and for `patches_ctd/` on top of that.
 - `patches/` and `patches_on_minimal/` are identical to `dv_diag` commit `e3bd85da` except comments, the four removed placeholder fields (column path fields that were always zero) and the fill values.
 - `patches_ctd/` contains only the cloud-top diagnostic changes of commit `b5195044`; the other changes on that branch are not included.
 - The `dv_diag` code was compiled with gfortran 8.5 and `-DUSE_COSP` and used in model runs. The cleaned patch sets were not recompiled as a whole and no run was made with them.
@@ -172,9 +172,9 @@ fincl2    = 'ACTT_CAL','ACTP_CAL','ACT_ITF_CAL','DBZE_CS_MEAN','DBZE_CS_LINMEAN'
 
 ## Related repositories
 
-- [mg2_limiter_update](https://github.com/diegovillanueva/mg2_limiter_update): droplet freezing limiter and microphysics switches for MG2 (CESM 2.1.5 default), with the run configurations.
-- [PUMAS_interface_215](https://github.com/diegovillanueva/PUMAS_interface_215): CAM patches that let CESM 2.1.5 run PUMAS.
-- [pumas_limiter_update](https://github.com/diegovillanueva/pumas_limiter_update): the droplet freezing limiter for PUMAS, applied on top of PUMAS_interface_215.
+- [mg2_limiter_update](https://github.com/diegovillanueva/mg2_limiter_update) ([doi:10.5281/zenodo.24365669](https://doi.org/10.5281/zenodo.24365669)): droplet freezing limiter and microphysics switches for MG2 (CESM 2.1.5 default), with the run configurations.
+- [PUMAS_interface_215](https://github.com/diegovillanueva/PUMAS_interface_215) ([doi:10.5281/zenodo.24365680](https://doi.org/10.5281/zenodo.24365680)): CAM patches that let CESM 2.1.5 run PUMAS.
+- [pumas_limiter_update](https://github.com/diegovillanueva/pumas_limiter_update) ([doi:10.5281/zenodo.24365685](https://doi.org/10.5281/zenodo.24365685)): the droplet freezing limiter for PUMAS, applied on top of PUMAS_interface_215.
 
 ## Data availability
 
@@ -184,7 +184,7 @@ Model output of the runs is available from the author on request.
 
 The changes in this repository are released under the BSD 3-Clause License (`LICENSE`). The patches modify CESM2/CAM6 source code, copyright UCAR, which remains under the CESM2 terms of use; see `NOTICE`.
 
-Please cite Villanueva et al. (in review) and this software via the Zenodo DOI of the release (metadata in `CITATION.cff`). A Zenodo DOI is minted for release v1.0.0.
+Please cite Villanueva et al. (in review) and this software, [doi:10.5281/zenodo.24365675](https://doi.org/10.5281/zenodo.24365675) (metadata in `CITATION.cff`).
 
 ## Contact
 
